@@ -18,21 +18,96 @@
 
 #include "log.h"
 
-#define LINES_USER	"_lines"
-#define LINES_PORT	"601"
+#define LINES_USER		"_lines"
+#define LINES_PORT		"601"
+
+#define LINES_BUFLEN		(1 << 10)
+#define LINES_BUFLEN_MAX	(256 << 10)
+
+struct refcnt {
+	unsigned int refs;
+};
+
+enum line_state {
+	S_BEGINNING = 0,
+	S_PRE_LINE,
+	S_LINE,
+
+	S_UTF8_3,
+	S_UTF8_2,
+	S_UTF8_1,
+
+	S_DEAD,
+};
+
+static const char *line_state_names[] = {
+	"BEGINNING",
+	"PRE_LINE",
+	"LINE",
+	"UFT8_3",
+	"UFT8_2",
+	"UFT8_1",
+	"DEAD",
+};
+
+/*
+ * anything at this state or above represents and invalid byte
+ * sequence to end on.
+ */
+
+static inline int
+line_state_invalid(state)
+{
+	return (state >= S_UTF8_3);
+}
+
+struct line {
+	TAILQ_ENTRY(line)		 entry;
+
+	void				(*dtor)(struct line *);
+	void				*cookie;
+
+	char				*laddr;
+	char				*lport;
+	char				*raddr;
+	char				*rport;
+	unsigned int			 seq;
+
+	struct timespec			 ts;
+
+	unsigned char			 buf[1]; /* must be last */
+
+	/*
+	 * this is followed by extra bytes that store the actual
+	 * line. the one byte buf is used to account for the
+	 * terminating '\0'.
+	 */
+};
+
+TAILQ_HEAD(lines, line);
 
 struct conn {
 	struct server			*server;
 	struct event			 ev;
+
+	struct refcnt			 refs;
+	unsigned int			 seq;
 
 	char				*laddr;
 	char				*lport;
 	char				*raddr;
 	char				*rport;
 
-	char				*buf;
-	size_t				 len;
-	size_t				 off;
+	/* state of the buffer */
+	unsigned char			*buf;
+	size_t				 buflen;
+
+	/* state of the message */
+	enum line_state			 state;
+	struct timespec			 ts;
+	size_t				 head;
+	size_t				 tail;
+	size_t				 next;
 };
 
 struct listener {
@@ -47,17 +122,39 @@ TAILQ_HEAD(listeners, listener);
 
 struct server {
 	struct listeners		 listeners;
+
+	struct lines			 lines;
+	struct event			 store;
 };
 
 static void	server_bind(struct server *s, int,
 		    const char *, const char *);
 static void	server_listen(struct server *s);
+static void	server_store(int, short, void *);
 
 static void	listener_accept(int, short, void *);
 
 static void	tcp_read(int, short, void *);
 
 static void	db_connect(struct server *, const char *);
+
+static void
+refcnt_init(struct refcnt *r)
+{
+	r->refs = 1;
+}
+
+static void
+refcnt_take(struct refcnt *r)
+{
+	++r->refs;
+}
+
+static int
+refcnt_rele(struct refcnt *r)
+{
+	return (--r->refs == 0);
+}
 
 __dead static void
 usage(void)
@@ -69,6 +166,8 @@ usage(void)
 	exit(1);
 }
 
+static const struct timeval store_timeval = { 0, 10000 };
+
 int debug = 0;
 
 int
@@ -76,6 +175,7 @@ main(int argc, char *argv[])
 {
 	struct server server = {
 		.listeners = TAILQ_HEAD_INITIALIZER(server.listeners),
+		.lines = TAILQ_HEAD_INITIALIZER(server.lines),
 	};
 	struct server *s = &server;
 
@@ -137,6 +237,7 @@ main(int argc, char *argv[])
 
 	event_init();
 
+	evtimer_set(&s->store, server_store, s);
 	server_listen(s);
 
 	event_dispatch();
@@ -155,6 +256,7 @@ server_bind(struct server *s, int af, const char *host, const char *port)
 	int serrno;
 	const char *cause;
 	int fd;
+	int reuseaddr;
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = af;
@@ -168,6 +270,7 @@ server_bind(struct server *s, int af, const char *host, const char *port)
 	}
 
 	for (res = res0; res != NULL; res = res->ai_next) {
+
 		fd = socket(res->ai_family, res->ai_socktype | SOCK_NONBLOCK,
 		    res->ai_protocol);
 		if (fd == -1) {
@@ -189,6 +292,13 @@ server_bind(struct server *s, int af, const char *host, const char *port)
 			close(fd);
 			continue;
 		}
+
+		reuseaddr = 1;
+		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+		    &reuseaddr, sizeof(reuseaddr)) == -1) {
+			warn("host %s port %s enable reuseaddr",
+			    host ? host : "*", port);
+                }
 
 		l = malloc(sizeof(*l));
 		if (l == NULL)
@@ -216,6 +326,24 @@ server_listen(struct server *s)
 		event_set(&l->ev, EVENT_FD(&l->ev), EV_READ|EV_PERSIST,
 		    listener_accept, l);
 		event_add(&l->ev, NULL);
+	}
+}
+
+static void
+server_store(int nope, short events, void *arg)
+{
+	struct server *s = arg;
+	struct line *line;
+
+	while ((line = TAILQ_FIRST(&s->lines)) != NULL) {
+		TAILQ_REMOVE(&s->lines, line, entry);
+
+		linfo("line from %s/%s -> %s/%s seq %u at %lld.%09ld: \"%s\"",
+		    line->raddr, line->rport, line->laddr, line->lport,
+		    line->seq, line->ts.tv_sec, line->ts.tv_nsec, line->buf);
+
+		(*line->dtor)(line);
+		free(line);
 	}
 }
 
@@ -289,15 +417,17 @@ listener_accept(int fd, short events, void *arg)
 		goto free_laddr;
 	}
 
-	conn->buf = malloc(1024);
+	conn->buf = malloc(LINE_BUFLEN);
 	if (conn->buf == NULL) {
 		lwarn("%s port %s connection buffer", host, serv);
 		goto free_lport;
 	}
-	conn->len = 1024;
-	conn->off = 0;
+	conn->buflen = LINE_BUFLEN;
 
 	conn->server = l->server;
+
+	refcnt_init(&conn->refs);
+	conn->seq = 0;
 
 	event_set(&conn->ev, cfd, EV_READ|EV_PERSIST, tcp_read, conn);
 	event_add(&conn->ev, NULL);
@@ -320,12 +450,20 @@ close:
 	close(cfd);
 }
 
+static inline struct conn *
+conn_ref(struct conn *conn)
+{
+	refcnt_take(&conn->refs);
+	return (conn);
+}
 
 static void
-conn_close(struct conn *conn)
+conn_rele(struct conn *conn)
 {
-	event_del(&conn->ev);
-	close(EVENT_FD(&conn->ev));
+	if (!refcnt_rele(&conn->refs))
+		return;
+
+	ldebug("connection from %s freed", conn->raddr);
 
 	free(conn->buf);
 	free(conn->lport);
@@ -336,17 +474,155 @@ conn_close(struct conn *conn)
 }
 
 static void
+conn_close(struct conn *conn)
+{
+	event_del(&conn->ev);
+	close(EVENT_FD(&conn->ev));
+
+	linfo("connection from %s closed", conn->raddr);
+
+	conn_rele(conn);
+}
+
+static void
+line_dtor_conn(struct line *line)
+{
+	conn_rele(line->cookie);
+}
+
+static int
+line_parse_utf8(int ch)
+{
+	return ((ch & 0xc0) == 0x80);
+}
+
+static enum line_state
+line_parse(struct conn *conn, int ch)
+{
+	enum line_state state = conn->state;
+
+	/* whatever state we were in, a newline resets it */
+	if (ch == '\n' || ch == '\0') {
+		struct server *s = conn->server;
+		struct line *line;
+		unsigned int seq;
+		size_t len;
+
+		if (line_state_invalid(state))
+			return (S_DEAD);
+		
+		len = conn->tail - conn->head;
+
+		if (len == 0) {
+			ldebug("empty line from %s", conn->raddr);
+			goto reset;
+		}
+
+		seq = conn->seq++;
+
+		line = malloc(sizeof(*line) + len);
+		if (line == NULL) {
+			lwarn("unable to allocate %zu byte line from %s",
+			    len, conn->raddr);
+			goto reset;
+		}
+
+		line->laddr = conn->laddr;
+		line->lport = conn->lport;
+		line->raddr = conn->raddr;
+		line->rport = conn->rport;
+		line->seq = seq;
+		line->ts = conn->ts;
+
+		memcpy(line->buf, conn->buf + conn->head, len);
+		line->buf[len] = '\0';
+
+		line->cookie = conn_ref(conn);
+		line->dtor = line_dtor_conn;
+
+		TAILQ_INSERT_TAIL(&s->lines, line, entry);
+		if (!evtimer_pending(&s->store, NULL))
+			evtimer_add(&s->store, &store_timeval);
+
+reset:
+		conn->head = conn->tail = conn->next;
+		return (S_BEGINNING);
+	}
+
+	switch (state) {
+	case S_BEGINNING:
+		if (clock_gettime(CLOCK_REALTIME, &conn->ts) == -1)
+			err(1, "get time");
+
+		/* FALLTHROUGH */
+	case S_PRE_LINE:
+		if (isspace(ch)) {
+			/* move the line forward */
+			conn->head = conn->tail = conn->next;
+			return (S_PRE_LINE);
+		}
+
+		/* FALLTHROUGH */
+	case S_LINE:
+		if (ch & 0x80) {
+			/* start of utf8 sequence */
+			switch (ch & 0xe0) {
+			case 0xc0:
+				return (S_UTF8_1);
+			case 0xe0:
+				switch (ch & 0xf0) {
+				case 0xe0:
+					return (S_UTF8_2);
+				case 0xf0:
+					switch (ch & 0xf8) {
+					case 0xf0:
+						return (S_UTF8_3);
+						break;
+					}
+					break;
+				}
+				break;
+			}
+
+			/* invalid */
+			return (S_DEAD);
+		} else if (isspace(ch)) {
+			;
+		} else if (!isprint(ch)) {
+			return (S_DEAD);
+		} else {
+			conn->tail = conn->next;
+		}
+
+		return (S_LINE);
+
+	case S_UTF8_3:
+	case S_UTF8_2:
+		if (!line_parse_utf8(ch))
+			return (S_DEAD);
+		return (state + 1);
+
+	case S_UTF8_1:
+		if (!line_parse_utf8(ch))
+			return (S_DEAD);
+
+		conn->tail = conn->next;
+		return (S_LINE);
+
+	case S_DEAD:
+		lwarnx("line parser called while state is S_DEAD");
+		abort();
+	}
+}
+
+static void
 tcp_read(int cfd, short events, void *arg)
 {
 	struct conn *conn = arg;
-	char *head, *tail, *cur;
 	ssize_t rv;
 	size_t len, i;
 
-	head = conn->buf;
-	tail = head + conn->off;
-
-	rv = read(cfd, tail, conn->len - conn->off);
+	rv = read(cfd, conn->buf, conn->buflen);
 	switch (rv) {
 	case -1:
 		switch (errno) {
@@ -368,45 +644,25 @@ tcp_read(int cfd, short events, void *arg)
 	}
 
 	len = rv;
+
+	conn->state = S_BEGINNING;
+	conn->head = conn->tail = 0;
+	conn->next = 0;
 	for (i = 0; i < len; i++) {
-		cur = &tail[i];
-		int ch = *cur;
+		enum line_state state;
+		int ch = conn->buf[conn->next++];
 
-		if (ch == '\n' || ch == '\0') {
-			/* terminate string and trim trailing whitespace */
-			for (;;) {
-				*cur = '\0';
-				if (cur == head)
-					break;
-				cur--;
-				if (!isspace(*cur))
-					break;
-				*cur = '\0';
-			}
-			/* trim leading whitespace */
-			while (head < cur) {
-				if (!isspace(*head))
-					break;
-				head++;
-			}
-
-			if (cur == head)
-				ldebug("empty line from %s", conn->raddr);
-			else
-				linfo("line from %s: %s", conn->raddr, head);
-
-			head = tail + i + 1;
-			continue;
+		state = line_parse(conn, ch);
+		linfo("\'%c\'(0x%02x): %s -> %s",
+		    isprint(ch) ? ch : '.', ch,
+		    line_state_names[conn->state], line_state_names[state]);
+		if (state == S_DEAD) {
+			lwarnx("invalid characters from %s, closing",
+			    conn->raddr);
+			conn_close(conn);
 		}
-	}
 
-	cur = tail + len;
-	if (head == cur) {
-		/* all the input has been consumed */
-		conn->off = 0;
-	} else if (head != conn->buf) {
-		linfo("buf %p head %p tail %p", conn->buf, head, tail);
-		conn->off = 0;
+		conn->state = state;
 	}
 }
 
