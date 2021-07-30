@@ -40,6 +40,7 @@ enum line_state {
 	S_DEAD,
 };
 
+#if 0
 static const char *line_state_names[] = {
 	"BEGINNING",
 	"PRE_LINE",
@@ -49,6 +50,7 @@ static const char *line_state_names[] = {
 	"UFT8_1",
 	"DEAD",
 };
+#endif
 
 /*
  * anything at this state or above represents and invalid byte
@@ -122,6 +124,10 @@ TAILQ_HEAD(listeners, listener);
 
 struct server {
 	struct listeners		 listeners;
+
+	PGconn				*db;
+	struct event			 db_ev_rd;
+	struct event			 db_ev_wr;
 
 	struct lines			 lines;
 	struct event			 store;
@@ -256,7 +262,7 @@ server_bind(struct server *s, int af, const char *host, const char *port)
 	int serrno;
 	const char *cause;
 	int fd;
-	int reuseaddr;
+	int reuse;
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = af;
@@ -293,10 +299,17 @@ server_bind(struct server *s, int af, const char *host, const char *port)
 			continue;
 		}
 
-		reuseaddr = 1;
+		reuse = 1;
+		if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT,
+		    &reuse, sizeof(reuse)) == -1) {
+			warn("host %s port %s enable reuse port",
+			    host ? host : "*", port);
+                }
+
+		reuse = 1;
 		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
-		    &reuseaddr, sizeof(reuseaddr)) == -1) {
-			warn("host %s port %s enable reuseaddr",
+		    &reuse, sizeof(reuse)) == -1) {
+			warn("host %s port %s enable reuse addr",
 			    host ? host : "*", port);
                 }
 
@@ -417,14 +430,18 @@ listener_accept(int fd, short events, void *arg)
 		goto free_laddr;
 	}
 
-	conn->buf = malloc(LINE_BUFLEN);
+	conn->buf = malloc(LINES_BUFLEN);
 	if (conn->buf == NULL) {
 		lwarn("%s port %s connection buffer", host, serv);
 		goto free_lport;
 	}
-	conn->buflen = LINE_BUFLEN;
+	conn->buflen = LINES_BUFLEN;
 
 	conn->server = l->server;
+
+	conn->state = S_BEGINNING;
+	conn->head = conn->tail = 0;
+	conn->next = 0;
 
 	refcnt_init(&conn->refs);
 	conn->seq = 0;
@@ -463,8 +480,6 @@ conn_rele(struct conn *conn)
 	if (!refcnt_rele(&conn->refs))
 		return;
 
-	ldebug("connection from %s freed", conn->raddr);
-
 	free(conn->buf);
 	free(conn->lport);
 	free(conn->laddr);
@@ -478,8 +493,6 @@ conn_close(struct conn *conn)
 {
 	event_del(&conn->ev);
 	close(EVENT_FD(&conn->ev));
-
-	linfo("connection from %s closed", conn->raddr);
 
 	conn_rele(conn);
 }
@@ -514,7 +527,6 @@ line_parse(struct conn *conn, int ch)
 		len = conn->tail - conn->head;
 
 		if (len == 0) {
-			ldebug("empty line from %s", conn->raddr);
 			goto reset;
 		}
 
@@ -622,7 +634,7 @@ tcp_read(int cfd, short events, void *arg)
 	ssize_t rv;
 	size_t len, i;
 
-	rv = read(cfd, conn->buf, conn->buflen);
+	rv = read(cfd, conn->buf + conn->next, conn->buflen - conn->next);
 	switch (rv) {
 	case -1:
 		switch (errno) {
@@ -636,7 +648,7 @@ tcp_read(int cfd, short events, void *arg)
 		}
 		return;
 	case 0:
-		ldebug("closing connection from %s", conn->raddr);
+		ldebug("connection from %s closed", conn->raddr);
 		conn_close(conn);
 		return;
 	default:
@@ -645,40 +657,61 @@ tcp_read(int cfd, short events, void *arg)
 
 	len = rv;
 
-	conn->state = S_BEGINNING;
-	conn->head = conn->tail = 0;
-	conn->next = 0;
 	for (i = 0; i < len; i++) {
 		enum line_state state;
 		int ch = conn->buf[conn->next++];
 
 		state = line_parse(conn, ch);
-		linfo("\'%c\'(0x%02x): %s -> %s",
-		    isprint(ch) ? ch : '.', ch,
-		    line_state_names[conn->state], line_state_names[state]);
 		if (state == S_DEAD) {
 			lwarnx("invalid characters from %s, closing",
 			    conn->raddr);
 			conn_close(conn);
+			return;
 		}
 
 		conn->state = state;
+	}
+
+	if (conn->head == conn->tail) {
+		conn->next -= conn->tail;
+		conn->head = conn->tail = 0;
+	}
+	if (conn->next == conn->buflen) {
+		unsigned char *nbuf;
+
+		if (conn->buflen >= LINES_BUFLEN_MAX) {
+			lwarnx("line from %s is too long (%zu bytes), closing",
+			    conn->raddr, conn->buflen);
+			conn_close(conn);
+			return;
+		}
+
+		conn->buflen *= 2;
+
+		nbuf = realloc(conn->buf, conn->buflen);
+		if (nbuf == NULL) {
+			lwarn("unable to grow buffer to %zu bytes for %s, "
+			    "closing", conn->buflen, conn->raddr);
+			conn_close(conn);
+			return;
+		}
+
+		conn->buf = nbuf;
 	}
 }
 
 static void
 db_connect(struct server *s, const char *conn)
 {
-	PGconn *db;
-
-	db = PQconnectdb(conn);
-	if (db == NULL)
+	s->db = PQconnectdb(conn);
+	if (s->db == NULL)
 		errc(1, ENOMEM, "postgres connect");
 
-	if (PQstatus(db) != CONNECTION_OK) {
+	if (PQstatus(s->db) != CONNECTION_OK) {
 		warnx("postgresql connection failed");
-		fprintf(stderr, "%s", PQerrorMessage(db));
+		fprintf(stderr, "%s", PQerrorMessage(s->db));
+		exit(1);
 	}
 
-	PQfinish(db);
+	PQfinish(s->db);
 }
