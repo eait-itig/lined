@@ -10,15 +10,17 @@
 #include <ctype.h>
 #include <pwd.h>
 #include <netdb.h>
+#include <uuid.h>
 #include <errno.h>
 #include <err.h>
+#include <assert.h>
 
 #include <event.h>
 #include <libpq-fe.h>
 
 #include "log.h"
 
-#define LINES_USER		"_lines"
+#define LINES_USER		"_lined"
 #define LINES_PORT		"601"
 
 #define LINES_BUFLEN		(1 << 10)
@@ -29,7 +31,6 @@ struct refcnt {
 };
 
 enum line_state {
-	S_BEGINNING = 0,
 	S_PRE_LINE,
 	S_LINE,
 
@@ -42,7 +43,6 @@ enum line_state {
 
 #if 0
 static const char *line_state_names[] = {
-	"BEGINNING",
 	"PRE_LINE",
 	"LINE",
 	"UFT8_3",
@@ -63,19 +63,40 @@ line_state_invalid(state)
 	return (state >= S_UTF8_3);
 }
 
+/*
+ * 2021-07-30 16:45:00.123456+10:00
+ *           1         2         3 32
+ * 01234567890123456789012345678901
+ */
+#define TIMESTAMPTZ_LEN		33
+
+static const char insert_stmt[] = "ins_stmt";
+static const char insert[] = "INSERT INTO \"lines\" ("
+	"\"ts\", \"id\", \"type\", "
+	"\"saddr\", \"sport\", \"daddr\", \"dport\", \"seq\", "
+	"\"msg\""
+") VALUES ("
+	"$1, $2, $3, "
+	"$4, $5, $6, $7, $8, "
+	"$9"
+")";
+
+#define INSERT_PARAMS	9
+
 struct line {
 	TAILQ_ENTRY(line)		 entry;
 
 	void				(*dtor)(struct line *);
 	void				*cookie;
 
+	char				 ts[TIMESTAMPTZ_LEN];
+	char				*id;
+
 	char				*laddr;
 	char				*lport;
 	char				*raddr;
 	char				*rport;
 	unsigned int			 seq;
-
-	struct timespec			 ts;
 
 	unsigned char			 buf[1]; /* must be last */
 
@@ -133,16 +154,20 @@ struct server {
 	struct event			 store;
 };
 
-static void	server_bind(struct server *s, int,
-		    const char *, const char *);
-static void	server_listen(struct server *s);
-static void	server_store(int, short, void *);
+static void	 server_bind(struct server *s, int,
+		     const char *, const char *);
+static void	 server_listen(struct server *s);
+static void	 server_store(int, short, void *);
 
-static void	listener_accept(int, short, void *);
+static void	 listener_accept(int, short, void *);
 
-static void	tcp_read(int, short, void *);
+static void	 tcp_read(int, short, void *);
 
-static void	db_connect(struct server *, const char *);
+static void	 db_connect(struct server *, const char *);
+
+static char	*id_gen(void);
+static void	 timestamptz(char *, size_t, const struct timespec *)
+		     __attribute__ ((__bounded__(__buffer__,1,2)));
 
 static void
 refcnt_init(struct refcnt *r)
@@ -192,7 +217,7 @@ main(int argc, char *argv[])
 
 	struct passwd *pw;
 
-	while ((ch = getopt(argc, argv, "du:")) != -1) {
+	while ((ch = getopt(argc, argv, "dp:u:")) != -1) {
 		switch (ch) {
 		case 'd':
 			debug = 1;
@@ -343,6 +368,39 @@ server_listen(struct server *s)
 }
 
 static void
+server_store_line(struct server *s, struct line *line)
+{
+	PGresult *result;
+	char seq[32];
+	int rv;
+
+	const char *values[INSERT_PARAMS] = {
+		line->ts, line->id, "syslog",
+		line->raddr, line->rport, line->laddr, line->lport, seq,
+		line->buf
+	};
+
+	rv = snprintf(seq, sizeof(seq), "%lld", (long long)line->seq);
+	if (rv < 0)
+		lerrx(1, "%s: seq encoding error", __func__);
+	if ((size_t)rv >= sizeof(seq))
+		lerrx(1, "%s: seq buffer too small", __func__);
+
+	result = PQexecPrepared(s->db, insert_stmt, INSERT_PARAMS,
+	    values, NULL, NULL, 0);
+	if (result == NULL) {
+		lwarnc(ENOMEM, "db exec %s, dropping line from %s",
+		    insert_stmt, line->raddr);
+		return;
+	}
+	if (PQresultStatus(result) != PGRES_COMMAND_OK) {
+		lwarnx("db exec %s: %s", insert_stmt,
+		    PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY));
+	}
+	PQclear(result);
+}
+
+static void
 server_store(int nope, short events, void *arg)
 {
 	struct server *s = arg;
@@ -351,11 +409,15 @@ server_store(int nope, short events, void *arg)
 	while ((line = TAILQ_FIRST(&s->lines)) != NULL) {
 		TAILQ_REMOVE(&s->lines, line, entry);
 
-		linfo("line from %s/%s -> %s/%s seq %u at %lld.%09ld: \"%s\"",
+		linfo("%s %s, line from %s/%s -> %s/%s seq %u: \"%s\"",
+		    line->ts, line->id,
 		    line->raddr, line->rport, line->laddr, line->lport,
-		    line->seq, line->ts.tv_sec, line->ts.tv_nsec, line->buf);
+		    line->seq, line->buf);
+
+		server_store_line(s, line);
 
 		(*line->dtor)(line);
+		free(line->id);
 		free(line);
 	}
 }
@@ -439,7 +501,7 @@ listener_accept(int fd, short events, void *arg)
 
 	conn->server = l->server;
 
-	conn->state = S_BEGINNING;
+	conn->state = S_PRE_LINE;
 	conn->head = conn->tail = 0;
 	conn->next = 0;
 
@@ -526,9 +588,8 @@ line_parse(struct conn *conn, int ch)
 		
 		len = conn->tail - conn->head;
 
-		if (len == 0) {
+		if (len == 0)
 			goto reset;
-		}
 
 		seq = conn->seq++;
 
@@ -544,7 +605,14 @@ line_parse(struct conn *conn, int ch)
 		line->raddr = conn->raddr;
 		line->rport = conn->rport;
 		line->seq = seq;
-		line->ts = conn->ts;
+		timestamptz(line->ts, sizeof(line->ts), &conn->ts);
+		line->id = id_gen();
+		if (line->id == NULL) {
+			lwarn("unable to generate id for line from %s",
+			    conn->raddr);
+			free(line);
+			goto reset;
+		}
 
 		memcpy(line->buf, conn->buf + conn->head, len);
 		line->buf[len] = '\0';
@@ -558,21 +626,19 @@ line_parse(struct conn *conn, int ch)
 
 reset:
 		conn->head = conn->tail = conn->next;
-		return (S_BEGINNING);
+		return (S_PRE_LINE);
 	}
 
 	switch (state) {
-	case S_BEGINNING:
-		if (clock_gettime(CLOCK_REALTIME, &conn->ts) == -1)
-			err(1, "get time");
-
-		/* FALLTHROUGH */
 	case S_PRE_LINE:
 		if (isspace(ch)) {
 			/* move the line forward */
 			conn->head = conn->tail = conn->next;
 			return (S_PRE_LINE);
 		}
+
+		if (clock_gettime(CLOCK_REALTIME, &conn->ts) == -1)
+			lerr(1, "get time");
 
 		/* FALLTHROUGH */
 	case S_LINE:
@@ -701,8 +767,65 @@ tcp_read(int cfd, short events, void *arg)
 }
 
 static void
+timestamptz(char *dst, size_t dstlen, const struct timespec *ts)
+{
+	struct tm tm;
+	int rv;
+
+	if (localtime_r(&ts->tv_sec, &tm) == NULL)
+		lerrx(1, "localtime");
+
+	rv = snprintf(dst, dstlen,
+	    "%04d-%02d-%02d %02d:%02d:%02d.%06ld%+02ld:%02ld",
+	    1900 + tm.tm_year, tm.tm_mon + 1, tm.tm_mday,
+	    tm.tm_hour, tm.tm_min, tm.tm_sec, ts->tv_nsec / 1000,
+	    tm.tm_gmtoff / 3600, labs(tm.tm_gmtoff / 60) % 60);
+	if (rv < 0)
+		lerrx(1, "%s encoding error", __func__);
+
+	if (dstlen <= (size_t)rv)
+		lerrx(1, "%s dstlen %zu too short (%d)", __func__, dstlen, rv);
+}
+
+static char *
+id_gen(void)
+{
+	uuid_t uuid;
+	uint32_t status;
+	char *id;
+
+	uuid_create(&uuid, &status);
+	if (status != uuid_s_ok)
+		lerrx(1, "%s: uuid_create status=%u", __func__, status);
+
+	uuid_to_string(&uuid, &id, &status);
+	switch (status) {
+	case uuid_s_ok:
+		break;
+	case uuid_s_no_memory:
+		errno = ENOMEM;
+		return (NULL);
+	default:
+		lerrx(1, "%s: uuid_to_string status=%u", __func__, status);
+	}
+
+	return (id);
+}
+
+static void
 db_connect(struct server *s, const char *conn)
 {
+	PGresult *result;
+	struct timespec ts;
+	char tstz[TIMESTAMPTZ_LEN];
+	char *id = id_gen();
+
+	const char *values[INSERT_PARAMS] = {
+		tstz, id, NULL,
+		NULL, NULL, NULL, NULL, NULL,
+		"testing line insert"
+	};
+
 	s->db = PQconnectdb(conn);
 	if (s->db == NULL)
 		errc(1, ENOMEM, "postgres connect");
@@ -713,5 +836,52 @@ db_connect(struct server *s, const char *conn)
 		exit(1);
 	}
 
-	PQfinish(s->db);
+	result = PQprepare(s->db, insert_stmt, insert, INSERT_PARAMS, NULL);
+	if (result == NULL)
+		errc(1, ENOMEM, "prepare");
+	if (PQresultStatus(result) != PGRES_COMMAND_OK) {
+		fprintf(stderr, "%s", PQresultErrorMessage(result));
+		exit(1);
+	}
+	PQclear(result);
+
+	result = PQexec(s->db, "BEGIN");
+	if (result == NULL)
+		errc(1, ENOMEM, "db BEGIN");
+	if (PQresultStatus(result) != PGRES_COMMAND_OK) {
+		warnx("db BEGIN");
+		fprintf(stderr, "%s", PQresultErrorMessage(result));
+		exit(1);
+	}
+	PQclear(result);
+
+	if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
+		err(1, "clock get time");
+	timestamptz(tstz, sizeof(tstz), &ts);
+
+	result = PQexecPrepared(s->db, insert_stmt, INSERT_PARAMS,
+	    values, NULL, NULL, 0);
+	if (result == NULL)
+		errc(1, ENOMEM, "db exec %s", insert_stmt);
+	if (PQresultStatus(result) != PGRES_COMMAND_OK) {
+		warnx("db exec %s (%s %s): %s", insert_stmt, tstz, id,
+		    PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY));
+		fprintf(stderr, "%s", PQresultErrorMessage(result));
+		exit(1);
+	}
+	PQclear(result);
+
+	free(id);
+
+	result = PQexec(s->db, "ROLLBACK");
+	if (result == NULL)
+		errc(1, ENOMEM, "db ROLLBACK");
+	if (PQresultStatus(result) != PGRES_COMMAND_OK) {
+		warnx("db ROLLBACK");
+		fprintf(stderr, "%s", PQresultErrorMessage(result));
+		exit(1);
+	}
+	PQclear(result);
+
+//	PQfinish(s->db);
 }
