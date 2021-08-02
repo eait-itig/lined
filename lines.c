@@ -20,6 +20,10 @@
 
 #include "log.h"
 
+#ifndef min
+#define min(_a, _b) ((_a) < (_b) ? (_a) : (_b))
+#endif
+
 #define LINES_USER		"_lined"
 #define LINES_PORT		"601"
 
@@ -30,38 +34,19 @@ struct refcnt {
 	unsigned int refs;
 };
 
-enum line_state {
-	S_PRE_LINE,
-	S_LINE,
+enum syslog_state {
+	S_IDLE,
 
+	S_MSG_LEN,
+	S_OCTETS,
+
+	S_LINE,
 	S_UTF8_3,
 	S_UTF8_2,
 	S_UTF8_1,
 
 	S_DEAD,
 };
-
-#if 0
-static const char *line_state_names[] = {
-	"PRE_LINE",
-	"LINE",
-	"UFT8_3",
-	"UFT8_2",
-	"UFT8_1",
-	"DEAD",
-};
-#endif
-
-/*
- * anything at this state or above represents and invalid byte
- * sequence to end on.
- */
-
-static inline int
-line_state_invalid(state)
-{
-	return (state >= S_UTF8_3);
-}
 
 /*
  * 2021-07-30 16:45:00.123456+10:00
@@ -71,24 +56,28 @@ line_state_invalid(state)
 #define TIMESTAMPTZ_LEN		33
 
 static const char insert_stmt[] = "ins_stmt";
-static const char insert[] = "INSERT INTO \"lines\" ("
+static const char insert[] = "INSERT INTO \"messages\" ("
+	"\"saddr\", \"sport\", \"daddr\", \"dport\", "
+	"\"conn\", \"seq\", "
 	"\"ts\", \"id\", \"type\", "
-	"\"saddr\", \"sport\", \"daddr\", \"dport\", \"seq\", "
 	"\"msg\""
 ") VALUES ("
-	"$1, $2, $3, "
-	"$4, $5, $6, $7, $8, "
-	"$9"
+	"$1, $2, $3, $4, "
+	"$5, $6, "
+	"$7, $8, $9, $10"
 ")";
 
-#define INSERT_PARAMS	9
+#define INSERT_PARAMS	10
 
-struct line {
-	TAILQ_ENTRY(line)		 entry;
+static const char type_syslog[] = 	"syslog";
 
-	void				(*dtor)(struct line *);
+struct message {
+	TAILQ_ENTRY(message)		 entry;
+
+	void				(*dtor)(struct message *);
 	void				*cookie;
 
+	const char			*type;
 	char				 ts[TIMESTAMPTZ_LEN];
 	char				*id;
 
@@ -96,18 +85,20 @@ struct line {
 	char				*lport;
 	char				*raddr;
 	char				*rport;
+	char				*connid;
 	unsigned int			 seq;
 
+	size_t				 buflen;
 	unsigned char			 buf[1]; /* must be last */
 
 	/*
 	 * this is followed by extra bytes that store the actual
-	 * line. the one byte buf is used to account for the
-	 * terminating '\0'.
+	 * message. the one byte buf is used to account for a
+	 * terminating '\0' if needed.
 	 */
 };
 
-TAILQ_HEAD(lines, line);
+TAILQ_HEAD(messages, message);
 
 struct conn {
 	struct server			*server;
@@ -116,6 +107,7 @@ struct conn {
 	struct refcnt			 refs;
 	unsigned int			 seq;
 
+	char				*id;
 	char				*laddr;
 	char				*lport;
 	char				*raddr;
@@ -126,11 +118,12 @@ struct conn {
 	size_t				 buflen;
 
 	/* state of the message */
-	enum line_state			 state;
+	unsigned int			 state;
 	struct timespec			 ts;
 	size_t				 head;
 	size_t				 tail;
 	size_t				 next;
+	size_t				 octets;
 };
 
 struct listener {
@@ -150,7 +143,7 @@ struct server {
 	struct event			 db_ev_rd;
 	struct event			 db_ev_wr;
 
-	struct lines			 lines;
+	struct messages			 messages;
 	struct event			 store;
 };
 
@@ -161,7 +154,7 @@ static void	 server_store(int, short, void *);
 
 static void	 listener_accept(int, short, void *);
 
-static void	 tcp_read(int, short, void *);
+static void	 syslog_read(int, short, void *);
 
 static void	 db_connect(struct server *, const char *);
 
@@ -206,7 +199,7 @@ main(int argc, char *argv[])
 {
 	struct server server = {
 		.listeners = TAILQ_HEAD_INITIALIZER(server.listeners),
-		.lines = TAILQ_HEAD_INITIALIZER(server.lines),
+		.messages = TAILQ_HEAD_INITIALIZER(server.messages),
 	};
 	struct server *s = &server;
 
@@ -368,29 +361,39 @@ server_listen(struct server *s)
 }
 
 static void
-server_store_line(struct server *s, struct line *line)
+server_store_message(struct server *s, struct message *msg)
 {
 	PGresult *result;
 	char seq[32];
 	int rv;
 
 	const char *values[INSERT_PARAMS] = {
-		line->ts, line->id, "syslog",
-		line->raddr, line->rport, line->laddr, line->lport, seq,
-		line->buf
+		msg->raddr, msg->rport, msg->laddr, msg->lport,
+		msg->connid, seq,
+		msg->ts, msg->id, type_syslog, msg->buf
+	};
+	int lengths[INSERT_PARAMS] = {
+		0, 0, 0, 0,
+		0, 0,
+		0, 0, 0, 1,
+	};
+	int formats[INSERT_PARAMS] = {
+		0, 0, 0, 0,
+		0, 0,
+		0, 0, 0, (int)msg->buflen,
 	};
 
-	rv = snprintf(seq, sizeof(seq), "%lld", (long long)line->seq);
+	rv = snprintf(seq, sizeof(seq), "%lld", (long long)msg->seq);
 	if (rv < 0)
 		lerrx(1, "%s: seq encoding error", __func__);
 	if ((size_t)rv >= sizeof(seq))
 		lerrx(1, "%s: seq buffer too small", __func__);
 
 	result = PQexecPrepared(s->db, insert_stmt, INSERT_PARAMS,
-	    values, NULL, NULL, 0);
+	    values, formats, lengths, 0);
 	if (result == NULL) {
-		lwarnc(ENOMEM, "db exec %s, dropping line from %s",
-		    insert_stmt, line->raddr);
+		lwarnc(ENOMEM, "db exec %s, dropping message from %s",
+		    insert_stmt, msg->raddr);
 		return;
 	}
 	if (PQresultStatus(result) != PGRES_COMMAND_OK) {
@@ -404,21 +407,22 @@ static void
 server_store(int nope, short events, void *arg)
 {
 	struct server *s = arg;
-	struct line *line;
+	struct message *msg;
 
-	while ((line = TAILQ_FIRST(&s->lines)) != NULL) {
-		TAILQ_REMOVE(&s->lines, line, entry);
+	while ((msg = TAILQ_FIRST(&s->messages)) != NULL) {
+		TAILQ_REMOVE(&s->messages, msg, entry);
 
-		linfo("%s %s, line from %s/%s -> %s/%s seq %u: \"%s\"",
-		    line->ts, line->id,
-		    line->raddr, line->rport, line->laddr, line->lport,
-		    line->seq, line->buf);
+		linfo("%s %s, msg from %s/%s -> %s/%s %s seq %u: \"%s\"",
+		    msg->ts, msg->id,
+		    msg->raddr, msg->rport, msg->laddr, msg->lport,
+		    msg->connid, msg->seq,
+		    msg->buf);
 
-		server_store_line(s, line);
+		server_store_message(s, msg);
 
-		(*line->dtor)(line);
-		free(line->id);
-		free(line);
+		(*msg->dtor)(msg);
+		free(msg->id);
+		free(msg);
 	}
 }
 
@@ -455,10 +459,16 @@ listener_accept(int fd, short events, void *arg)
 		goto close;
 	}
 
+	conn->id = id_gen();
+	if (conn->id == NULL) {
+		lwarn("%s port %s connection id", host, serv);
+		goto free_conn;
+	}
+
 	conn->raddr = strdup(host);
 	if (conn->raddr == NULL) {
 		lwarn("%s port %s connection raddr", host, serv);
-		goto free_conn;
+		goto free_id;
 	}
 
 	conn->rport = strdup(serv);
@@ -501,14 +511,14 @@ listener_accept(int fd, short events, void *arg)
 
 	conn->server = l->server;
 
-	conn->state = S_PRE_LINE;
+	conn->state = S_IDLE;
 	conn->head = conn->tail = 0;
 	conn->next = 0;
 
 	refcnt_init(&conn->refs);
 	conn->seq = 0;
 
-	event_set(&conn->ev, cfd, EV_READ|EV_PERSIST, tcp_read, conn);
+	event_set(&conn->ev, cfd, EV_READ|EV_PERSIST, syslog_read, conn);
 	event_add(&conn->ev, NULL);
 
 	ldebug("connection from %s", conn->raddr);
@@ -523,6 +533,8 @@ free_rport:
 	free(conn->rport);
 free_raddr:
 	free(conn->raddr);
+free_id:
+	free(conn->id);
 free_conn:
 	free(conn);
 close:
@@ -547,6 +559,7 @@ conn_rele(struct conn *conn)
 	free(conn->laddr);
 	free(conn->rport);
 	free(conn->raddr);
+	free(conn->id);
 	free(conn);
 }
 
@@ -560,9 +573,9 @@ conn_close(struct conn *conn)
 }
 
 static void
-line_dtor_conn(struct line *line)
+message_dtor_conn(struct message *msg)
 {
-	conn_rele(line->cookie);
+	conn_rele(msg->cookie);
 }
 
 static int
@@ -571,76 +584,95 @@ line_parse_utf8(int ch)
 	return ((ch & 0xc0) == 0x80);
 }
 
-static enum line_state
-line_parse(struct conn *conn, int ch)
+static void
+message_queue(struct conn *conn)
 {
-	enum line_state state = conn->state;
+	struct server *s = conn->server;
+	struct message *msg;
+	unsigned int seq;
+	size_t len;
 
-	/* whatever state we were in, a newline resets it */
-	if (ch == '\n' || ch == '\0') {
-		struct server *s = conn->server;
-		struct line *line;
-		unsigned int seq;
-		size_t len;
+	len = conn->tail - conn->head;
+	if (len == 0)
+		goto reset;
 
-		if (line_state_invalid(state))
-			return (S_DEAD);
-		
-		len = conn->tail - conn->head;
+	seq = conn->seq++;
 
-		if (len == 0)
-			goto reset;
-
-		seq = conn->seq++;
-
-		line = malloc(sizeof(*line) + len);
-		if (line == NULL) {
-			lwarn("unable to allocate %zu byte line from %s",
-			    len, conn->raddr);
-			goto reset;
-		}
-
-		line->laddr = conn->laddr;
-		line->lport = conn->lport;
-		line->raddr = conn->raddr;
-		line->rport = conn->rport;
-		line->seq = seq;
-		timestamptz(line->ts, sizeof(line->ts), &conn->ts);
-		line->id = id_gen();
-		if (line->id == NULL) {
-			lwarn("unable to generate id for line from %s",
-			    conn->raddr);
-			free(line);
-			goto reset;
-		}
-
-		memcpy(line->buf, conn->buf + conn->head, len);
-		line->buf[len] = '\0';
-
-		line->cookie = conn_ref(conn);
-		line->dtor = line_dtor_conn;
-
-		TAILQ_INSERT_TAIL(&s->lines, line, entry);
-		if (!evtimer_pending(&s->store, NULL))
-			evtimer_add(&s->store, &store_timeval);
-
-reset:
-		conn->head = conn->tail = conn->next;
-		return (S_PRE_LINE);
+	msg = malloc(sizeof(*msg) + len);
+	if (msg == NULL) {
+		lwarn("unable to allocate %zu bytes for message from %s",
+		    len, conn->raddr);
+		goto reset;
 	}
 
+	msg->laddr = conn->laddr;
+	msg->lport = conn->lport;
+	msg->raddr = conn->raddr;
+	msg->rport = conn->rport;
+	msg->connid = conn->id;
+	msg->seq = seq;
+	timestamptz(msg->ts, sizeof(msg->ts), &conn->ts);
+	msg->id = id_gen();
+	if (msg->id == NULL) {
+		lwarn("unable to generate id for message from %s",
+		    conn->raddr);
+		free(msg);
+		goto reset;
+	}
+
+	memcpy(msg->buf, conn->buf + conn->head, len);
+	msg->buf[len] = '\0';
+	msg->buflen = len;
+
+	msg->cookie = conn_ref(conn);
+	msg->dtor = message_dtor_conn;
+
+	TAILQ_INSERT_TAIL(&s->messages, msg, entry);
+	if (!evtimer_pending(&s->store, NULL))
+		evtimer_add(&s->store, &store_timeval);
+
+reset:
+	conn->head = conn->tail = conn->next;
+}
+
+static enum syslog_state
+syslog_parse(struct conn *conn, enum syslog_state state, int ch)
+{
 	switch (state) {
-	case S_PRE_LINE:
-		if (isspace(ch)) {
-			/* move the line forward */
-			conn->head = conn->tail = conn->next;
-			return (S_PRE_LINE);
-		}
+	case S_IDLE:
+		if (ch == '<') {
+			/* Non-Transparent-Framing */
+			state = S_LINE;
+		} else if (isdigit(ch)) {
+			conn->octets = ch - '0';
+			state = S_MSG_LEN;
+		} else
+			return (S_DEAD);
 
 		if (clock_gettime(CLOCK_REALTIME, &conn->ts) == -1)
 			lerr(1, "get time");
 
-		/* FALLTHROUGH */
+		return (state);
+
+	case S_MSG_LEN:
+		if (ch == ' ') {
+			conn->head = conn->tail = conn->next;
+			state = S_OCTETS;
+		} else if (isdigit(ch)) {
+			conn->octets *= 10;
+			conn->octets += ch - '0';
+			if (conn->octets > LINES_BUFLEN_MAX)
+				return (S_DEAD);
+		} else
+			return (S_DEAD);
+
+		return (state);
+
+	case S_OCTETS:
+		lwarnx("syslog parser called while state is S_OCTETS");
+		abort();
+		/* NOTREACHED */
+
 	case S_LINE:
 		if (ch & 0x80) {
 			/* start of utf8 sequence */
@@ -664,6 +696,9 @@ reset:
 
 			/* invalid */
 			return (S_DEAD);
+		} else if (ch == '\n' || ch == '\0') {
+			message_queue(conn);
+			state = S_IDLE;
 		} else if (isspace(ch)) {
 			;
 		} else if (!isprint(ch)) {
@@ -672,7 +707,7 @@ reset:
 			conn->tail = conn->next;
 		}
 
-		return (S_LINE);
+		return (state);
 
 	case S_UTF8_3:
 	case S_UTF8_2:
@@ -688,17 +723,19 @@ reset:
 		return (S_LINE);
 
 	case S_DEAD:
-		lwarnx("line parser called while state is S_DEAD");
+		lwarnx("syslog parser called while state is S_DEAD");
 		abort();
 	}
 }
 
+
 static void
-tcp_read(int cfd, short events, void *arg)
+syslog_read(int cfd, short events, void *arg)
 {
 	struct conn *conn = arg;
 	ssize_t rv;
-	size_t len, i;
+	size_t len;
+	enum syslog_state state;
 
 	rv = read(cfd, conn->buf + conn->next, conn->buflen - conn->next);
 	switch (rv) {
@@ -723,20 +760,52 @@ tcp_read(int cfd, short events, void *arg)
 
 	len = rv;
 
-	for (i = 0; i < len; i++) {
-		enum line_state state;
-		int ch = conn->buf[conn->next++];
+	state = conn->state;
+	do {
+		size_t octets;
+		int ch;
 
-		state = line_parse(conn, ch);
-		if (state == S_DEAD) {
-			lwarnx("invalid characters from %s, closing",
-			    conn->raddr);
-			conn_close(conn);
-			return;
+		switch (state) {
+		case S_OCTETS:
+			octets = min(conn->octets, len);
+			conn->tail += octets;
+			conn->next += octets;
+
+			conn->octets -= octets;
+			if (conn->octets == 0) {
+				/* trim trailing whitespace */
+				size_t tail = conn->tail;
+				while (tail > conn->head) {
+					tail--;
+					ch = conn->buf[tail];
+					if (!isspace(ch))
+						break;
+					conn->tail = tail;
+				}
+				message_queue(conn);
+				conn->head = conn->tail = conn->next;
+				state = S_IDLE;
+			}
+
+			len -= octets;
+			break;
+
+		default:
+			ch = conn->buf[conn->next++];
+			state = syslog_parse(conn, state, ch);
+			if (state == S_DEAD) {
+				lwarnx("invalid line from %s, closing",
+				    conn->raddr);
+				conn_close(conn);
+				return;
+			}
+
+			len--;
+			break;
 		}
 
 		conn->state = state;
-	}
+	} while (len > 0);
 
 	if (conn->head == conn->tail) {
 		conn->next -= conn->tail;
@@ -821,8 +890,8 @@ db_connect(struct server *s, const char *conn)
 	char *id = id_gen();
 
 	const char *values[INSERT_PARAMS] = {
+		NULL, NULL, NULL, NULL, NULL, NULL,
 		tstz, id, NULL,
-		NULL, NULL, NULL, NULL, NULL,
 		"testing line insert"
 	};
 
