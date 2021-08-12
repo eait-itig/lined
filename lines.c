@@ -24,6 +24,12 @@
 #define min(_a, _b) ((_a) < (_b) ? (_a) : (_b))
 #endif
 
+static inline int
+istrailer(int ch)
+{
+	return (ch == '\0' || isspace(ch));
+}
+
 #define LINES_USER		"_lined"
 #define LINES_PORT		"601"
 
@@ -136,8 +142,20 @@ struct listener {
 
 TAILQ_HEAD(listeners, listener);
 
+struct receiver {
+	TAILQ_ENTRY(receiver)		 entry;
+	struct server			*server;
+	struct event			 ev;
+
+	int				(*cmsg2dst)(struct sockaddr_storage *,
+					    struct cmsghdr *);
+};
+
+TAILQ_HEAD(receivers, receiver);
+
 struct server {
 	struct listeners		 listeners;
+	struct receivers		 receivers;
 
 	PGconn				*db;
 	struct event			 db_ev_rd;
@@ -147,12 +165,19 @@ struct server {
 	struct event			 store;
 };
 
-static void	 server_bind(struct server *s, int,
+static void	 listeners_bind(struct server *s, int,
+		     const char *, const char *);
+static void	 receivers_bind(struct server *s, int,
 		     const char *, const char *);
 static void	 server_listen(struct server *s);
+static void	 server_receive(struct server *s);
 static void	 server_store(int, short, void *);
 
 static void	 listener_accept(int, short, void *);
+
+static void	 syslog_recv(int, short, void *);
+static int	 receiver_dst4(struct sockaddr_storage *, struct cmsghdr *);
+static int	 receiver_dst6(struct sockaddr_storage *, struct cmsghdr *);
 
 static void	 syslog_read(int, short, void *);
 
@@ -199,6 +224,7 @@ main(int argc, char *argv[])
 {
 	struct server server = {
 		.listeners = TAILQ_HEAD_INITIALIZER(server.listeners),
+		.receivers = TAILQ_HEAD_INITIALIZER(server.receivers),
 		.messages = TAILQ_HEAD_INITIALIZER(server.messages),
 	};
 	struct server *s = &server;
@@ -239,7 +265,8 @@ main(int argc, char *argv[])
 	if (pw == NULL)
 		errx(1, "no %s user", user);
 
-	server_bind(s, AF_UNSPEC, NULL, LINES_PORT);
+	listeners_bind(s, AF_UNSPEC, NULL, LINES_PORT);
+	receivers_bind(s, AF_UNSPEC, NULL, LINES_PORT);
 
 	if (chdir(pw->pw_dir) == -1)
 		err(1, "%s", pw->pw_dir);
@@ -263,6 +290,7 @@ main(int argc, char *argv[])
 
 	evtimer_set(&s->store, server_store, s);
 	server_listen(s);
+	server_receive(s);
 
 	event_dispatch();
 
@@ -270,7 +298,7 @@ main(int argc, char *argv[])
 }
 
 static void
-server_bind(struct server *s, int af, const char *host, const char *port)
+listeners_bind(struct server *s, int af, const char *host, const char *port)
 {
 	struct listeners listeners = TAILQ_HEAD_INITIALIZER(listeners);
 	struct listener *l;
@@ -289,12 +317,11 @@ server_bind(struct server *s, int af, const char *host, const char *port)
 
 	error = getaddrinfo(host, port, &hints, &res0);
 	if (error != 0) {
-		errx(1, "host %s port %s: %s", host ? host : "*", port,
-		    gai_strerror(error));
+		errx(1, "listener %s port %s: %s",
+		    host ? host : "*", port, gai_strerror(error));
 	}
 
 	for (res = res0; res != NULL; res = res->ai_next) {
-
 		fd = socket(res->ai_family, res->ai_socktype | SOCK_NONBLOCK,
 		    res->ai_protocol);
 		if (fd == -1) {
@@ -320,14 +347,14 @@ server_bind(struct server *s, int af, const char *host, const char *port)
 		reuse = 1;
 		if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT,
 		    &reuse, sizeof(reuse)) == -1) {
-			warn("host %s port %s enable reuse port",
+			warn("listener %s port %s enable reuse port",
 			    host ? host : "*", port);
                 }
 
 		reuse = 1;
 		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
 		    &reuse, sizeof(reuse)) == -1) {
-			warn("host %s port %s enable reuse addr",
+			warn("listener %s port %s enable reuse addr",
 			    host ? host : "*", port);
                 }
 
@@ -340,11 +367,112 @@ server_bind(struct server *s, int af, const char *host, const char *port)
 	}
 
 	if (TAILQ_EMPTY(&listeners)) {
-		errc(1, serrno, "host %s port %s %s", host ? host : "*", port,
-		    cause);
+		errc(1, serrno, "listener %s port %s %s",
+		    host ? host : "*", port, cause);
 	}
 
 	TAILQ_CONCAT(&s->listeners, &listeners, entry);
+}
+
+static void
+receivers_bind(struct server *s, int af, const char *host, const char *port)
+{
+	struct receivers receivers = TAILQ_HEAD_INITIALIZER(receivers);
+	struct receiver *r;
+	int (*cmsg2dst)(struct sockaddr_storage *, struct cmsghdr *);
+
+	struct addrinfo hints, *res, *res0;
+	int error;
+	int serrno;
+	const char *cause;
+	int fd;
+	int on;
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = af;
+	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_protocol = IPPROTO_UDP;
+	hints.ai_flags = AI_PASSIVE;
+
+	error = getaddrinfo(host, port, &hints, &res0);
+	if (error != 0) {
+		errx(1, "receiver %s port %s: %s",
+		    host ? host : "*", port,
+		    gai_strerror(error));
+	}
+
+	for (res = res0; res != NULL; res = res->ai_next) {
+		fd = socket(res->ai_family, res->ai_socktype | SOCK_NONBLOCK,
+		    res->ai_protocol);
+		if (fd == -1) {
+			serrno = errno;
+			cause = "socket";
+			continue;
+		}
+
+		if (bind(fd, res->ai_addr, res->ai_addrlen) == -1) {
+			serrno = errno;
+			cause = "bind";
+			close(fd);
+			continue;
+		}
+
+		on = 1;
+		if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT,
+		    &on, sizeof(on)) == -1) {
+			warn("receiver %s port %s enable reuse port",
+			    host ? host : "*", port);
+                }
+
+		on = 1;
+		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+		    &on, sizeof(on)) == -1) {
+			warn("receiver %s port %s enable reuse addr",
+			    host ? host : "*", port);
+                }
+
+		switch (res->ai_family) {
+		case AF_INET:
+			cmsg2dst = receiver_dst4;
+
+			on = 1;
+			if (setsockopt(fd, IPPROTO_IP, IP_RECVDSTADDR,
+			    &on, sizeof(on)) == -1)
+				err(1, "setsockopt(IP_RECVDSTADDR)");
+			on = 1;
+			if (setsockopt(fd, IPPROTO_IP, IP_RECVDSTPORT,
+			    &on, sizeof(on)) == -1)
+				err(1, "setsockopt(IP_RECVDSTPORT)");
+			break;
+		case AF_INET6:
+			cmsg2dst = receiver_dst6;
+
+			on = 1;
+			if (setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO,
+			    &on, sizeof(on)) == -1)
+				err(1, "setsockopt(IPV6_RECVPKTINFO)");
+			on = 1;
+			if (setsockopt(fd, IPPROTO_IPV6, IPV6_RECVDSTPORT,
+			    &on, sizeof(on)) == -1)
+				err(1, "setsockopt(IPV6_RECVDSTPORT)");
+			break;
+		}
+
+		r = malloc(sizeof(*r));
+		if (r == NULL)
+			err(1, "receiver alloc");
+
+		r->cmsg2dst = cmsg2dst;
+		event_set(&r->ev, fd, 0, NULL, NULL);
+		TAILQ_INSERT_TAIL(&receivers, r, entry);
+	}
+
+	if (TAILQ_EMPTY(&receivers)) {
+		errc(1, serrno, "receiver %s port %s %s",
+		    host ? host : "*", port, cause);
+	}
+
+	TAILQ_CONCAT(&s->receivers, &receivers, entry);
 }
 
 static void
@@ -357,6 +485,19 @@ server_listen(struct server *s)
 		event_set(&l->ev, EVENT_FD(&l->ev), EV_READ|EV_PERSIST,
 		    listener_accept, l);
 		event_add(&l->ev, NULL);
+	}
+}
+
+static void
+server_receive(struct server *s)
+{
+	struct receiver *r;
+
+	TAILQ_FOREACH(r, &s->receivers, entry) {
+		r->server = s;
+		event_set(&r->ev, EVENT_FD(&r->ev), EV_READ|EV_PERSIST,
+		    syslog_recv, r);
+		event_add(&r->ev, NULL);
 	}
 }
 
@@ -383,11 +524,14 @@ server_store_message(struct server *s, struct message *msg)
 		0, 0, 0, (int)msg->buflen,
 	};
 
-	rv = snprintf(seq, sizeof(seq), "%lld", (long long)msg->seq);
-	if (rv < 0)
-		lerrx(1, "%s: seq encoding error", __func__);
-	if ((size_t)rv >= sizeof(seq))
-		lerrx(1, "%s: seq buffer too small", __func__);
+	if (msg->connid != NULL) {
+		rv = snprintf(seq, sizeof(seq), "%lld", (long long)msg->seq);
+		if (rv < 0)
+			lerrx(1, "%s: seq encoding error", __func__);
+		if ((size_t)rv >= sizeof(seq))
+			lerrx(1, "%s: seq buffer too small", __func__);
+	} else
+		values[5] = NULL;
 
 	result = PQexecPrepared(s->db, insert_stmt, INSERT_PARAMS,
 	    values, formats, lengths, 0);
@@ -412,10 +556,9 @@ server_store(int nope, short events, void *arg)
 	while ((msg = TAILQ_FIRST(&s->messages)) != NULL) {
 		TAILQ_REMOVE(&s->messages, msg, entry);
 
-		linfo("%s %s, msg from %s/%s -> %s/%s %s seq %u: \"%s\"",
+		linfo("%s %s: %s/%s -> %s/%s: \"%s\"",
 		    msg->ts, msg->id,
 		    msg->raddr, msg->rport, msg->laddr, msg->lport,
-		    msg->connid, msg->seq,
 		    msg->buf);
 
 		server_store_message(s, msg);
@@ -778,7 +921,7 @@ syslog_read(int cfd, short events, void *arg)
 				while (tail > conn->head) {
 					tail--;
 					ch = conn->buf[tail];
-					if (!isspace(ch))
+					if (!istrailer(ch))
 						break;
 					conn->tail = tail;
 				}
@@ -833,6 +976,221 @@ syslog_read(int cfd, short events, void *arg)
 
 		conn->buf = nbuf;
 	}
+}
+
+static int
+receiver_dst4(struct sockaddr_storage *ss, struct cmsghdr *cmsg)
+{
+	struct sockaddr_in *sin = (struct sockaddr_in *)ss;
+
+	if (cmsg->cmsg_level != IPPROTO_IP)
+		return (0);
+
+	switch (cmsg->cmsg_type) {
+	case IP_RECVDSTADDR:
+		memcpy(&sin->sin_addr, CMSG_DATA(cmsg), sizeof(sin->sin_addr));
+		if (sin->sin_addr.s_addr == INADDR_BROADCAST)
+			return (-1);
+		break;
+
+        case IP_RECVDSTPORT:
+                memcpy(&sin->sin_port, CMSG_DATA(cmsg), sizeof(sin->sin_port));
+                break;
+        }
+
+	return (0);
+}
+
+static int
+receiver_dst6(struct sockaddr_storage *ss, struct cmsghdr *cmsg)
+{
+	struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ss;
+	struct in6_pktinfo *ipi = (struct in6_pktinfo *)CMSG_DATA(cmsg);
+
+	if (cmsg->cmsg_level != IPPROTO_IPV6)
+                return (0);
+
+	switch (cmsg->cmsg_type) {
+	case IPV6_PKTINFO:
+		memcpy(&sin6->sin6_addr, &ipi->ipi6_addr,
+		    sizeof(sin6->sin6_addr));
+#ifdef __KAME__
+		if (IN6_IS_ADDR_LINKLOCAL(&ipi->ipi6_addr))
+			sin6->sin6_scope_id = ipi->ipi6_ifindex;
+#endif
+		break;
+	case IPV6_RECVDSTPORT:
+		memcpy(&sin6->sin6_port, CMSG_DATA(cmsg),
+		    sizeof(sin6->sin6_port));
+		break;
+	}
+
+	return (0);
+}
+
+static void
+message_dtor_recv(struct message *msg)
+{
+	free(msg->lport);
+	free(msg->laddr);
+	free(msg->rport);
+	free(msg->raddr);
+}
+
+static void
+syslog_recv(int fd, short events, void *arg)
+{
+	struct receiver *r = arg;
+	struct server *s = r->server;
+	struct message *msg;
+
+	union {
+		struct cmsghdr hdr;
+		char buf[CMSG_SPACE(sizeof(struct sockaddr_storage)) +
+		    CMSG_SPACE(sizeof(in_port_t))];
+	} cmsgbuf;
+	struct cmsghdr *cmsg;
+	struct msghdr msghdr;
+	struct iovec iov;
+	ssize_t rv;
+
+	unsigned char buf[4096];
+	struct sockaddr_storage src, dst;
+	size_t len, tail;
+	struct timespec ts;
+	char host[NI_MAXHOST];
+	char serv[NI_MAXSERV];
+	int error;
+
+	memset(&msghdr, 0, sizeof(msghdr));
+	iov.iov_base = buf;
+	iov.iov_len = sizeof(buf);
+	msghdr.msg_name = &src;
+	msghdr.msg_namelen = sizeof(src);
+	msghdr.msg_iov = &iov;
+	msghdr.msg_iovlen = 1;
+	msghdr.msg_control = &cmsgbuf.buf;
+	msghdr.msg_controllen = sizeof(cmsgbuf.buf);
+
+	rv = recvmsg(fd, &msghdr, 0);
+	if (rv == -1) {
+		switch (errno) {
+		case EAGAIN:
+		case EINTR:
+			break;
+		default:
+			lwarn("%s", __func__);
+			break;
+		}
+		return;
+	}
+
+	memset(&dst, 0, sizeof(dst));
+	dst.ss_family = src.ss_family;
+	dst.ss_len = src.ss_len;
+
+	/* get local address if possible */
+	for (cmsg = CMSG_FIRSTHDR(&msghdr); cmsg != NULL;
+	    cmsg = CMSG_NXTHDR(&msghdr, cmsg)) {
+		if (r->cmsg2dst(&dst, cmsg) == -1)
+			return;
+	}
+
+	len = (size_t)rv;
+
+	/* trim trailing whitespace */
+	tail = len;
+	while (tail > 0) {
+		int ch;
+
+		tail--;
+		ch = buf[tail];
+		if (!istrailer(ch))
+			break;
+		len = tail;
+	}
+
+	if (len == 0)
+		return;
+
+	if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
+		lerr(1, "get time");
+
+	error = getnameinfo((struct sockaddr *)&src, msghdr.msg_namelen,
+	    host, sizeof(host), serv, sizeof(serv),
+	    NI_NUMERICHOST|NI_NUMERICSERV);
+	if (error != 0) {
+		lwarnx("%s src name lookup: %s", __func__,
+		    gai_strerror(error));
+		return;
+	}
+
+	msg = malloc(sizeof(*msg) + len);
+	if (msg == NULL) {
+		lwarn("unable to allocate %zu bytes for message from %s",
+		    len, host);
+		return;
+	}
+
+	memset(msg, 0, sizeof(*msg));
+
+	msg->raddr = strdup(host);
+	if (msg->raddr == NULL)
+		goto free_msg;
+	msg->rport = strdup(serv);
+	if (msg->rport == NULL)
+		goto free_raddr;
+
+	error = getnameinfo((struct sockaddr *)&dst, msghdr.msg_namelen,
+	    host, sizeof(host), serv, sizeof(serv),
+	    NI_NUMERICHOST|NI_NUMERICSERV);
+	if (error != 0) {
+		lwarnx("%s dst name lookup: %s", __func__,
+		    gai_strerror(error));
+		goto free_rport;
+	}
+
+	msg->laddr = strdup(host);
+	if (msg->laddr == NULL)
+		goto free_rport;
+	msg->lport = strdup(serv);
+	if (msg->lport == NULL)
+		goto free_laddr;
+
+	msg->connid = NULL;
+	msg->seq = 0;
+
+	timestamptz(msg->ts, sizeof(msg->ts), &ts);
+	msg->id = id_gen();
+	if (msg->id == NULL) {
+		lwarn("unable to generate id for message from %s",
+		    msg->raddr);
+		goto free_lport;
+	}
+
+	memcpy(msg->buf, buf, len);
+	msg->buf[len] = '\0';
+	msg->buflen = len;
+
+	msg->cookie = NULL;
+	msg->dtor = message_dtor_recv;
+
+	TAILQ_INSERT_TAIL(&s->messages, msg, entry);
+	if (!evtimer_pending(&s->store, NULL))
+		evtimer_add(&s->store, &store_timeval);
+
+	return;
+
+free_lport:
+	free(msg->lport);
+free_laddr:
+	free(msg->laddr);
+free_rport:
+	free(msg->rport);
+free_raddr:
+	free(msg->raddr);
+free_msg:
+	free(msg);
 }
 
 static void
