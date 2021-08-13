@@ -330,6 +330,13 @@ listeners_bind(struct server *s, int af, const char *host, const char *port)
 			continue;
 		}
 
+		reuse = 1;
+		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+		    &reuse, sizeof(reuse)) == -1) {
+			warn("listener %s port %s enable reuse addr",
+			    host ? host : "*", port);
+		}
+
 		if (bind(fd, res->ai_addr, res->ai_addrlen) == -1) {
 			serrno = errno;
 			cause = "bind";
@@ -343,20 +350,6 @@ listeners_bind(struct server *s, int af, const char *host, const char *port)
 			close(fd);
 			continue;
 		}
-
-		reuse = 1;
-		if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT,
-		    &reuse, sizeof(reuse)) == -1) {
-			warn("listener %s port %s enable reuse port",
-			    host ? host : "*", port);
-                }
-
-		reuse = 1;
-		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
-		    &reuse, sizeof(reuse)) == -1) {
-			warn("listener %s port %s enable reuse addr",
-			    host ? host : "*", port);
-                }
 
 		l = malloc(sizeof(*l));
 		if (l == NULL)
