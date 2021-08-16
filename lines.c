@@ -243,8 +243,9 @@ usage(void)
 {
 	extern char *__progname;
 
-	fprintf(stderr, "usage: %s [-d] [-c cert_file] [-k key_file] "
-	    "[-u user]\n", __progname);
+	fprintf(stderr, "usage: %s [-d] [-a CA_file] [-A CA_path] "
+	    "[-c cert_file] [-k key_file]\n"
+	    "\t[-u user]\n", __progname);
 
 	exit(1);
 }
