@@ -53,7 +53,9 @@ istrailer(int ch)
 }
 
 #define LINES_USER		"_lined"
-#define LINES_PORT		"601"
+#define LINES_PORT_UDP		"601"
+#define LINES_PORT_TCP		"601"
+#define LINES_PORT_TLS		"syslog-tls"
 
 #define LINES_BUFLEN		(1 << 10)
 #define LINES_BUFLEN_MAX	(256 << 10)
@@ -243,9 +245,10 @@ usage(void)
 {
 	extern char *__progname;
 
-	fprintf(stderr, "usage: %s [-d] [-a CA_file] [-A CA_path] "
+	fprintf(stderr, "usage: %s [-d] [-A CA_path] [-a CA_file] "
 	    "[-c cert_file] [-k key_file]\n"
-	    "\t[-u user]\n", __progname);
+	    "\t[-S tls_port] [-T tcp_port] [-U udp_port] [-u user]\n",
+	    __progname);
 
 	exit(1);
 }
@@ -253,6 +256,15 @@ usage(void)
 static const struct timeval store_timeval = { 0, 10000 };
 
 int debug = 0;
+
+static const char *
+lines_port_opt(const char *arg)
+{
+	if (strcmp(arg, "-") == 0)
+		return (NULL);
+
+	return (arg);
+}
 
 int
 main(int argc, char *argv[])
@@ -264,6 +276,10 @@ main(int argc, char *argv[])
 		.messages = TAILQ_HEAD_INITIALIZER(server.messages),
 	};
 	struct server *s = &server;
+
+	const char *port_udp = LINES_PORT_UDP;
+	const char *port_tcp = LINES_PORT_TCP;
+	const char *port_tls = LINES_PORT_TLS;
 
 	const char *user = LINES_USER;
 	const char *conn = "";
@@ -279,7 +295,7 @@ main(int argc, char *argv[])
 
 	struct passwd *pw;
 
-	while ((ch = getopt(argc, argv, "A:a:c:dk:p:u:")) != -1) {
+	while ((ch = getopt(argc, argv, "A:a:c:dk:p:S:T:U:u:")) != -1) {
 		switch (ch) {
 		case 'A':
 			catype = "path";
@@ -302,6 +318,15 @@ main(int argc, char *argv[])
 			break;
 		case 'p':
 			conn = optarg;
+			break;
+		case 'S':
+			port_tls = lines_port_opt(optarg);
+			break;
+		case 'T':
+			port_tcp = lines_port_opt(optarg);
+			break;
+		case 'U':
+			port_udp = lines_port_opt(optarg);
 			break;
 		case 'u':
 			user = optarg;
@@ -329,16 +354,22 @@ main(int argc, char *argv[])
 	if (pw == NULL)
 		errx(1, "no %s user", user);
 
-	listeners_bind(&s->listeners, AF_UNSPEC, NULL, LINES_PORT);
-	listeners_bind(&s->slisteners, AF_UNSPEC, NULL, "syslog-tls");
-	receivers_bind(s, AF_UNSPEC, NULL, LINES_PORT);
-
 	if (chdir(pw->pw_dir) == -1)
 		err(1, "%s", pw->pw_dir);
 
+	if (port_udp != NULL)
+		receivers_bind(s, AF_UNSPEC, NULL, port_udp);
+	if (port_tcp != NULL)
+		listeners_bind(&s->listeners, AF_UNSPEC, NULL, port_tcp);
+
 	if (crt != NULL) {
+		if (port_tls == NULL)
+			errx(1, "TLS configured but listener disabled");
+
+		listeners_bind(&s->slisteners, AF_UNSPEC, NULL, port_tls);
+
 		if (tls_init() == -1)
-			errx(1, "tls init failed");
+ 			errx(1, "tls init failed");
 
 		s->tls_cfg = tls_config_new();
 		if (s->tls_cfg == NULL)
@@ -373,6 +404,11 @@ main(int argc, char *argv[])
 			errx(1, "TLS server configuration: %s",
 			    tls_error(s->tls_ctx));
 	}
+
+	if (TAILQ_EMPTY(&s->receivers) &&
+	    TAILQ_EMPTY(&s->listeners) &&
+	    TAILQ_EMPTY(&s->slisteners))
+		errx(1, "no protocols enabled");
 
 	if (setgroups(1, &pw->pw_gid) ||
 	    setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) ||
