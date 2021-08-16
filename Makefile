@@ -8,8 +8,8 @@ MAN=
 CFLAGS+=	${CFLAGS_PQ}
 LDFLAGS+=	${LDFLAGS_PQ}
 
-LDADD+=		-levent
-DPADD+=		${LIBEVENT}
+LDADD+=		-levent -ltls -lssl -lcrypto
+DPADD+=		${LIBEVENT} ${LIBTLS} ${LIBSSL} ${LIBCRYPTO}
 
 WARNINGS=	Yes
 DEBUG=		-g

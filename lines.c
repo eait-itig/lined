@@ -15,6 +15,7 @@
 #include <err.h>
 #include <assert.h>
 
+#include <tls.h>
 #include <event.h>
 #include <libpq-fe.h>
 
@@ -108,7 +109,9 @@ TAILQ_HEAD(messages, message);
 
 struct conn {
 	struct server			*server;
-	struct event			 ev;
+	struct event			 rev;
+	struct event			 wev;
+	struct tls			*tls_ctx;
 
 	struct refcnt			 refs;
 	unsigned int			 seq;
@@ -155,6 +158,7 @@ TAILQ_HEAD(receivers, receiver);
 
 struct server {
 	struct listeners		 listeners;
+	struct listeners		 slisteners;
 	struct receivers		 receivers;
 
 	PGconn				*db;
@@ -163,23 +167,31 @@ struct server {
 
 	struct messages			 messages;
 	struct event			 store;
+
+	struct tls			*tls_ctx;
+	struct tls_config		*tls_cfg;
 };
 
-static void	 listeners_bind(struct server *s, int,
-		     const char *, const char *);
+static void	 listeners_bind(struct listeners *,
+		     int, const char *, const char *);
 static void	 receivers_bind(struct server *s, int,
 		     const char *, const char *);
 static void	 server_listen(struct server *s);
+static void	 server_slisten(struct server *s);
 static void	 server_receive(struct server *s);
 static void	 server_store(int, short, void *);
 
-static void	 listener_accept(int, short, void *);
+static void	 listener_accept(struct listener *, int, int);
+static void	 listener_accept_ev(int, short, void *);
+static void	 slistener_accept_ev(int, short, void *);
 
 static void	 syslog_recv(int, short, void *);
 static int	 receiver_dst4(struct sockaddr_storage *, struct cmsghdr *);
 static int	 receiver_dst6(struct sockaddr_storage *, struct cmsghdr *);
 
 static void	 syslog_read(int, short, void *);
+static void	 syslog_tls_io(int, short, void *);
+static void	 syslog_input(struct conn *, size_t);
 
 static void	 db_connect(struct server *, const char *);
 
@@ -224,6 +236,7 @@ main(int argc, char *argv[])
 {
 	struct server server = {
 		.listeners = TAILQ_HEAD_INITIALIZER(server.listeners),
+		.slisteners = TAILQ_HEAD_INITIALIZER(server.slisteners),
 		.receivers = TAILQ_HEAD_INITIALIZER(server.receivers),
 		.messages = TAILQ_HEAD_INITIALIZER(server.messages),
 	};
@@ -231,13 +244,21 @@ main(int argc, char *argv[])
 
 	const char *user = LINES_USER;
 	const char *conn = "";
+	const char *cafile = NULL;
+	const char *capath = NULL;
 
 	int ch;
 
 	struct passwd *pw;
 
-	while ((ch = getopt(argc, argv, "dp:u:")) != -1) {
+	while ((ch = getopt(argc, argv, "A:a:dp:u:")) != -1) {
 		switch (ch) {
+		case 'A':
+			capath = optarg;
+			break;
+		case 'a':
+			cafile = optarg;
+			break;
 		case 'd':
 			debug = 1;
 			break;
@@ -258,6 +279,9 @@ main(int argc, char *argv[])
 	if (argc > 0)
 		usage();
 
+	if (cafile != NULL && capath != NULL)
+		errx(1, "CApath and CAfile both configured");
+
 	if (geteuid() != 0)
 		errx(1, "need root privileges");
 
@@ -265,8 +289,56 @@ main(int argc, char *argv[])
 	if (pw == NULL)
 		errx(1, "no %s user", user);
 
-	listeners_bind(s, AF_UNSPEC, NULL, LINES_PORT);
+	listeners_bind(&s->listeners, AF_UNSPEC, NULL, LINES_PORT);
+	listeners_bind(&s->slisteners, AF_UNSPEC, NULL, "syslog-tls");
 	receivers_bind(s, AF_UNSPEC, NULL, LINES_PORT);
+
+	if (!TAILQ_EMPTY(&s->slisteners)) {
+		if (tls_init() == -1)
+			errx(1, "tls init failed");
+
+		s->tls_cfg = tls_config_new();
+		if (s->tls_cfg == NULL)
+			errx(1, "tls server configuration creation failed");
+
+		if (tls_config_set_key_file(s->tls_cfg,
+		    "/etc/ssl/private/_lined.key") == -1) {
+			errx(1, "TLS key: %s",
+			    tls_config_error(s->tls_cfg));
+		}
+
+		if (tls_config_set_cert_file(s->tls_cfg,
+		    "/etc/ssl/_lined.pem") == -1) {
+			errx(1, "TLS certificate: %s",
+			    tls_config_error(s->tls_cfg));
+		}
+
+		if (cafile != NULL) {
+			if (tls_config_set_ca_file(s->tls_cfg, cafile) == -1) {
+				errx(1, "CA file: %s",
+				    tls_config_error(s->tls_cfg));
+			}
+			tls_config_verify_client(s->tls_cfg);
+		} else if (capath != NULL) {
+			if (tls_config_set_ca_path(s->tls_cfg, capath) == -1) {
+				errx(1, "CA path: %s",
+				    tls_config_error(s->tls_cfg));
+			}
+			tls_config_verify_client(s->tls_cfg);
+		} else {
+			warnx("TLS client certificate verification "
+			    "is not configured");
+		}
+
+		s->tls_ctx = tls_server();
+		if (s->tls_ctx == NULL)
+			errx(1, "tls server context creation failed");
+
+		if (tls_configure(s->tls_ctx, s->tls_cfg) != 0) {
+			errx(1, "TLS server configuration: %s",
+			    tls_config_error(s->tls_cfg));
+		}
+	}
 
 	if (chdir(pw->pw_dir) == -1)
 		err(1, "%s", pw->pw_dir);
@@ -290,6 +362,7 @@ main(int argc, char *argv[])
 
 	evtimer_set(&s->store, server_store, s);
 	server_listen(s);
+	server_slisten(s);
 	server_receive(s);
 
 	event_dispatch();
@@ -298,7 +371,8 @@ main(int argc, char *argv[])
 }
 
 static void
-listeners_bind(struct server *s, int af, const char *host, const char *port)
+listeners_bind(struct listeners *list,
+    int af, const char *host, const char *port)
 {
 	struct listeners listeners = TAILQ_HEAD_INITIALIZER(listeners);
 	struct listener *l;
@@ -364,7 +438,7 @@ listeners_bind(struct server *s, int af, const char *host, const char *port)
 		    host ? host : "*", port, cause);
 	}
 
-	TAILQ_CONCAT(&s->listeners, &listeners, entry);
+	TAILQ_CONCAT(list, &listeners, entry);
 }
 
 static void
@@ -476,7 +550,20 @@ server_listen(struct server *s)
 	TAILQ_FOREACH(l, &s->listeners, entry) {
 		l->server = s;
 		event_set(&l->ev, EVENT_FD(&l->ev), EV_READ|EV_PERSIST,
-		    listener_accept, l);
+		    listener_accept_ev, l);
+		event_add(&l->ev, NULL);
+	}
+}
+
+static void
+server_slisten(struct server *s)
+{
+	struct listener *l;
+
+	TAILQ_FOREACH(l, &s->slisteners, entry) {
+		l->server = s;
+		event_set(&l->ev, EVENT_FD(&l->ev), EV_READ|EV_PERSIST,
+		    slistener_accept_ev, l);
 		event_add(&l->ev, NULL);
 	}
 }
@@ -563,9 +650,20 @@ server_store(int nope, short events, void *arg)
 }
 
 static void
-listener_accept(int fd, short events, void *arg)
+listener_accept_ev(int fd, short events, void *arg)
 {
-	struct listener *l = arg;
+	listener_accept(arg, fd, 0);
+}
+
+static void
+slistener_accept_ev(int fd, short events, void *arg)
+{
+	listener_accept(arg, fd, 1);
+}
+
+static void
+listener_accept(struct listener *l, int fd, int tls)
+{
 	struct conn *conn;
 	int cfd;
 	struct sockaddr_storage ss;
@@ -585,8 +683,7 @@ listener_accept(int fd, short events, void *arg)
 	    NI_NUMERICHOST|NI_NUMERICSERV);
 	if (error != 0) {
 		lwarnx("connection name lookup: %s", gai_strerror(error));
-		close(cfd);
-		return;
+		goto close;
 	}
 
 	conn = malloc(sizeof(*conn));
@@ -654,13 +751,39 @@ listener_accept(int fd, short events, void *arg)
 	refcnt_init(&conn->refs);
 	conn->seq = 0;
 
-	event_set(&conn->ev, cfd, EV_READ|EV_PERSIST, syslog_read, conn);
-	event_add(&conn->ev, NULL);
+	if (tls) {
+		struct tls *ctx = conn->server->tls_ctx;
 
-	ldebug("connection from %s", conn->raddr);
+		if (tls_accept_socket(ctx, &conn->tls_ctx, cfd) == -1) {
+			lwarnx("%s port %s TLS accept: %s", host, serv,
+			    tls_error(ctx));
+			goto free_buf;
+		}
+
+		event_set(&conn->wev, cfd, EV_WRITE,
+		    syslog_tls_io, conn);
+		event_set(&conn->rev, cfd, EV_READ|EV_PERSIST,
+		    syslog_tls_io, conn);
+		event_add(&conn->rev, NULL);
+
+		ldebug("TLS connection from %s to %s",
+		    conn->raddr, conn->laddr);
+
+		syslog_tls_io(cfd, EV_READ, conn);
+	} else {
+		conn->tls_ctx = NULL;
+		event_set(&conn->rev, cfd, EV_READ|EV_PERSIST,
+		    syslog_read, conn);
+		event_add(&conn->rev, NULL);
+
+		ldebug("connection from %s to %s",
+		    conn->raddr, conn->laddr);
+	}
 
 	return;
 
+free_buf:
+	free(conn->buf);
 free_lport:
 	free(conn->lport);
 free_laddr:
@@ -702,8 +825,13 @@ conn_rele(struct conn *conn)
 static void
 conn_close(struct conn *conn)
 {
-	event_del(&conn->ev);
-	close(EVENT_FD(&conn->ev));
+	event_del(&conn->rev);
+	if (conn->tls_ctx != NULL) {
+		event_del(&conn->wev);
+		tls_close(conn->tls_ctx);
+		tls_free(conn->tls_ctx);
+	}
+	close(EVENT_FD(&conn->rev));
 
 	conn_rele(conn);
 }
@@ -864,14 +992,11 @@ syslog_parse(struct conn *conn, enum syslog_state state, int ch)
 	}
 }
 
-
 static void
 syslog_read(int cfd, short events, void *arg)
 {
 	struct conn *conn = arg;
 	ssize_t rv;
-	size_t len;
-	enum syslog_state state;
 
 	rv = read(cfd, conn->buf + conn->next, conn->buflen - conn->next);
 	switch (rv) {
@@ -894,7 +1019,40 @@ syslog_read(int cfd, short events, void *arg)
 		break;
 	}
 
-	len = rv;
+	syslog_input(conn, rv);
+}
+
+static void
+syslog_tls_io(int cfd, short events, void *arg)
+{
+	struct conn *conn = arg;
+	ssize_t rv;
+
+	rv = tls_read(conn->tls_ctx, conn->buf + conn->next,
+	    conn->buflen - conn->next);
+	switch (rv) {
+	case TLS_WANT_POLLIN:
+		/* just wait for the next conn->rev to fire */
+		return;
+	case TLS_WANT_POLLOUT:
+		event_add(&conn->wev, NULL);
+		return;
+
+	case -1:
+		lwarnx("%s tls io: %s", conn->raddr, tls_error(conn->tls_ctx));
+		conn_close(conn);
+		return;
+	default:
+		break;
+	}
+
+	syslog_input(conn, rv);
+}
+
+static void
+syslog_input(struct conn *conn, size_t len)
+{
+	enum syslog_state state;
 
 	state = conn->state;
 	do {
