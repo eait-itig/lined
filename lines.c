@@ -243,7 +243,8 @@ usage(void)
 {
 	extern char *__progname;
 
-	fprintf(stderr, "usage: %s [-d] [-u user]\n", __progname);
+	fprintf(stderr, "usage: %s [-d] [-c cert_file] [-k key_file] "
+	    "[-u user]\n", __progname);
 
 	exit(1);
 }
@@ -265,6 +266,10 @@ main(int argc, char *argv[])
 
 	const char *user = LINES_USER;
 	const char *conn = "";
+
+	const char *crt = NULL;
+	const char *key = NULL;
+
 	const char *catype = NULL;
 	const char *capath = NULL;
 	int (*cafunc)(struct tls_config *, const char *) = NULL;
@@ -273,7 +278,7 @@ main(int argc, char *argv[])
 
 	struct passwd *pw;
 
-	while ((ch = getopt(argc, argv, "A:a:dp:u:")) != -1) {
+	while ((ch = getopt(argc, argv, "A:a:c:dk:p:u:")) != -1) {
 		switch (ch) {
 		case 'A':
 			catype = "path";
@@ -285,8 +290,14 @@ main(int argc, char *argv[])
 			capath = optarg;
 			cafunc = tls_config_set_ca_file;
 			break;
+		case 'c':
+			crt = optarg;
+			break;
 		case 'd':
 			debug = 1;
+			break;
+		case 'k':
+			key = optarg;
 			break;
 		case 'p':
 			conn = optarg;
@@ -305,6 +316,11 @@ main(int argc, char *argv[])
 	if (argc > 0)
 		usage();
 
+	if ((crt == NULL) != (key == NULL)) {
+		warnx("key and certificate must be configured together");
+		usage();
+	}
+
 	if (geteuid() != 0)
 		errx(1, "need root privileges");
 
@@ -316,7 +332,7 @@ main(int argc, char *argv[])
 	listeners_bind(&s->slisteners, AF_UNSPEC, NULL, "syslog-tls");
 	receivers_bind(s, AF_UNSPEC, NULL, LINES_PORT);
 
-	if (!TAILQ_EMPTY(&s->slisteners)) {
+	if (crt != NULL) {
 		if (tls_init() == -1)
 			errx(1, "tls init failed");
 
@@ -324,14 +340,12 @@ main(int argc, char *argv[])
 		if (s->tls_cfg == NULL)
 			errx(1, "tls server configuration creation failed");
 
-		if (tls_config_set_cert_file(s->tls_cfg,
-		    "/etc/ssl/_lined.pem") == -1) {
+		if (tls_config_set_cert_file(s->tls_cfg, crt) == -1) {
 			errx(1, "TLS certificate: %s",
 			    tls_config_error(s->tls_cfg));
 		}
 
-		if (tls_config_set_key_file(s->tls_cfg,
-		    "/etc/ssl/private/_lined.key") == -1) {
+		if (tls_config_set_key_file(s->tls_cfg, key) == -1) {
 			errx(1, "TLS key: %s",
 			    tls_config_error(s->tls_cfg));
 		}
