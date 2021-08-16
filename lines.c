@@ -245,7 +245,7 @@ usage(void)
 {
 	extern char *__progname;
 
-	fprintf(stderr, "usage: %s [-d] [-A CA_path] [-a CA_file] "
+	fprintf(stderr, "usage: %s [-46d] [-A CA_path] [-a CA_file] "
 	    "[-c cert_file] [-k key_file]\n"
 	    "\t[-l address] [-S tls_port] [-T tcp_port] [-U udp_port]\n"
 	    "\t[-u user]\n", __progname);
@@ -277,6 +277,7 @@ main(int argc, char *argv[])
 	};
 	struct server *s = &server;
 
+	int family = AF_UNSPEC;
 	const char *host = NULL;
 	const char *port_udp = LINES_PORT_UDP;
 	const char *port_tcp = LINES_PORT_TCP;
@@ -296,8 +297,14 @@ main(int argc, char *argv[])
 
 	struct passwd *pw;
 
-	while ((ch = getopt(argc, argv, "A:a:c:dk:l:p:S:T:U:u:")) != -1) {
+	while ((ch = getopt(argc, argv, "46A:a:c:dk:l:p:S:T:U:u:")) != -1) {
 		switch (ch) {
+		case '4':
+			family = AF_INET;
+			break;
+		case '6':
+			family = AF_INET6;
+			break;
 		case 'A':
 			catype = "path";
 			capath = optarg;
@@ -362,15 +369,15 @@ main(int argc, char *argv[])
 		err(1, "%s", pw->pw_dir);
 
 	if (port_udp != NULL)
-		receivers_bind(s, AF_UNSPEC, host, port_udp);
+		receivers_bind(s, family, host, port_udp);
 	if (port_tcp != NULL)
-		listeners_bind(&s->listeners, AF_UNSPEC, host, port_tcp);
+		listeners_bind(&s->listeners, family, host, port_tcp);
 
 	if (crt != NULL) {
 		if (port_tls == NULL)
 			errx(1, "TLS configured but listener disabled");
 
-		listeners_bind(&s->slisteners, AF_UNSPEC, host, port_tls);
+		listeners_bind(&s->slisteners, family, host, port_tls);
 
 		if (tls_init() == -1)
  			errx(1, "tls init failed");
