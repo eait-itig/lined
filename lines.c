@@ -296,7 +296,7 @@ main(int argc, char *argv[])
 
 	struct passwd *pw;
 
-	while ((ch = getopt(argc, argv, "A:a:c:dk:p:S:T:U:u:")) != -1) {
+	while ((ch = getopt(argc, argv, "A:a:c:dk:l:p:S:T:U:u:")) != -1) {
 		switch (ch) {
 		case 'A':
 			catype = "path";
