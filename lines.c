@@ -247,8 +247,8 @@ usage(void)
 
 	fprintf(stderr, "usage: %s [-d] [-A CA_path] [-a CA_file] "
 	    "[-c cert_file] [-k key_file]\n"
-	    "\t[-S tls_port] [-T tcp_port] [-U udp_port] [-u user]\n",
-	    __progname);
+	    "\t[-l address] [-S tls_port] [-T tcp_port] [-U udp_port]\n"
+	    "\t[-u user]\n", __progname);
 
 	exit(1);
 }
@@ -277,6 +277,7 @@ main(int argc, char *argv[])
 	};
 	struct server *s = &server;
 
+	const char *host = NULL;
 	const char *port_udp = LINES_PORT_UDP;
 	const char *port_tcp = LINES_PORT_TCP;
 	const char *port_tls = LINES_PORT_TLS;
@@ -315,6 +316,9 @@ main(int argc, char *argv[])
 			break;
 		case 'k':
 			key = optarg;
+			break;
+		case 'l':
+			host = optarg;
 			break;
 		case 'p':
 			conn = optarg;
@@ -358,15 +362,15 @@ main(int argc, char *argv[])
 		err(1, "%s", pw->pw_dir);
 
 	if (port_udp != NULL)
-		receivers_bind(s, AF_UNSPEC, NULL, port_udp);
+		receivers_bind(s, AF_UNSPEC, host, port_udp);
 	if (port_tcp != NULL)
-		listeners_bind(&s->listeners, AF_UNSPEC, NULL, port_tcp);
+		listeners_bind(&s->listeners, AF_UNSPEC, host, port_tcp);
 
 	if (crt != NULL) {
 		if (port_tls == NULL)
 			errx(1, "TLS configured but listener disabled");
 
-		listeners_bind(&s->slisteners, AF_UNSPEC, NULL, port_tls);
+		listeners_bind(&s->slisteners, AF_UNSPEC, host, port_tls);
 
 		if (tls_init() == -1)
  			errx(1, "tls init failed");
