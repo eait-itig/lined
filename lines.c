@@ -265,8 +265,9 @@ main(int argc, char *argv[])
 
 	const char *user = LINES_USER;
 	const char *conn = "";
-	const char *cafile = NULL;
+	const char *catype = NULL;
 	const char *capath = NULL;
+	int (*cafunc)(struct tls_config *, const char *) = NULL;
 
 	int ch;
 
@@ -275,10 +276,14 @@ main(int argc, char *argv[])
 	while ((ch = getopt(argc, argv, "A:a:dp:u:")) != -1) {
 		switch (ch) {
 		case 'A':
+			catype = "path";
 			capath = optarg;
+			cafunc = tls_config_set_ca_path;
 			break;
 		case 'a':
-			cafile = optarg;
+			catype = "file";
+			capath = optarg;
+			cafunc = tls_config_set_ca_file;
 			break;
 		case 'd':
 			debug = 1;
@@ -299,9 +304,6 @@ main(int argc, char *argv[])
 
 	if (argc > 0)
 		usage();
-
-	if (cafile != NULL && capath != NULL)
-		errx(1, "CApath and CAfile both configured");
 
 	if (geteuid() != 0)
 		errx(1, "need root privileges");
@@ -334,15 +336,9 @@ main(int argc, char *argv[])
 			    tls_config_error(s->tls_cfg));
 		}
 
-		if (cafile != NULL) {
-			if (tls_config_set_ca_file(s->tls_cfg, cafile) == -1) {
-				errx(1, "CA file: %s",
-				    tls_config_error(s->tls_cfg));
-			}
-			tls_config_verify_client(s->tls_cfg);
-		} else if (capath != NULL) {
-			if (tls_config_set_ca_path(s->tls_cfg, capath) == -1) {
-				errx(1, "CA path: %s",
+		if (capath != NULL) {
+			if ((*cafunc)(s->tls_cfg, capath) == -1) {
+				errx(1, "CA %s: %s", catype,
 				    tls_config_error(s->tls_cfg));
 			}
 			tls_config_verify_client(s->tls_cfg);
