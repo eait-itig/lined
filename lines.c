@@ -322,15 +322,15 @@ main(int argc, char *argv[])
 		if (s->tls_cfg == NULL)
 			errx(1, "tls server configuration creation failed");
 
-		if (tls_config_set_key_file(s->tls_cfg,
-		    "/etc/ssl/private/_lined.key") == -1) {
-			errx(1, "TLS key: %s",
-			    tls_config_error(s->tls_cfg));
-		}
-
 		if (tls_config_set_cert_file(s->tls_cfg,
 		    "/etc/ssl/_lined.pem") == -1) {
 			errx(1, "TLS certificate: %s",
+			    tls_config_error(s->tls_cfg));
+		}
+
+		if (tls_config_set_key_file(s->tls_cfg,
+		    "/etc/ssl/private/_lined.key") == -1) {
+			errx(1, "TLS key: %s",
 			    tls_config_error(s->tls_cfg));
 		}
 
@@ -355,10 +355,9 @@ main(int argc, char *argv[])
 		if (s->tls_ctx == NULL)
 			errx(1, "tls server context creation failed");
 
-		if (tls_configure(s->tls_ctx, s->tls_cfg) != 0) {
+		if (tls_configure(s->tls_ctx, s->tls_cfg) != 0)
 			errx(1, "TLS server configuration: %s",
-			    tls_config_error(s->tls_cfg));
-		}
+			    tls_error(s->tls_ctx));
 	}
 
 	if (chdir(pw->pw_dir) == -1)
