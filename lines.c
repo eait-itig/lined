@@ -333,6 +333,9 @@ main(int argc, char *argv[])
 	listeners_bind(&s->slisteners, AF_UNSPEC, NULL, "syslog-tls");
 	receivers_bind(s, AF_UNSPEC, NULL, LINES_PORT);
 
+	if (chdir(pw->pw_dir) == -1)
+		err(1, "%s", pw->pw_dir);
+
 	if (crt != NULL) {
 		if (tls_init() == -1)
 			errx(1, "tls init failed");
@@ -370,9 +373,6 @@ main(int argc, char *argv[])
 			errx(1, "TLS server configuration: %s",
 			    tls_error(s->tls_ctx));
 	}
-
-	if (chdir(pw->pw_dir) == -1)
-		err(1, "%s", pw->pw_dir);
 
 	if (setgroups(1, &pw->pw_gid) ||
 	    setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) ||
