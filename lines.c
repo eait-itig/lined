@@ -923,7 +923,6 @@ conn_close(struct conn *conn)
 	event_del(&conn->rev);
 	if (conn->tls_ctx != NULL) {
 		event_del(&conn->wev);
-		tls_close(conn->tls_ctx);
 		tls_free(conn->tls_ctx);
 	}
 	close(EVENT_FD(&conn->rev));
@@ -1134,6 +1133,10 @@ syslog_tls_io(int cfd, short events, void *arg)
 
 	case -1:
 		lwarnx("%s tls io: %s", conn->raddr, tls_error(conn->tls_ctx));
+		conn_close(conn);
+		return;
+	case 0:
+		ldebug("TLS connection from %s closed", conn->raddr);
 		conn_close(conn);
 		return;
 	default:
