@@ -714,10 +714,12 @@ db_send_message(struct server *s)
 	} else
 		values[5] = NULL;
 
-	ldebug("%s %s: %s/%s -> %s/%s: \"%s\"",
-	    msg->ts, msg->id,
-	    msg->raddr, msg->rport, msg->laddr, msg->lport,
-	    msg->buf);
+	if (0) {
+		ldebug("%s %s: %s/%s -> %s/%s: \"%s\"",
+		    msg->ts, msg->id,
+		    msg->raddr, msg->rport, msg->laddr, msg->lport,
+		    msg->buf);
+	}
 
 	if (!PQsendQueryPrepared(s->db, insert_stmt, INSERT_PARAMS,
 	    values, formats, lengths, 0))
