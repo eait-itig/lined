@@ -21,6 +21,7 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <sys/queue.h>
 
 #include <stdio.h>
@@ -76,6 +77,19 @@ enum syslog_state {
 	S_UTF8_1,
 
 	S_DEAD,
+};
+
+enum db_state {
+	SDB_RESET,
+	SDB_PREPARE,
+	SDB_PREPARING,
+	SDB_IDLE,
+	SDB_BEGIN,
+	SDB_BEGINNING,
+	SDB_QUERY,
+	SDB_RESULT,
+	SDB_COMMIT,
+	SDB_COMMITTING
 };
 
 /*
@@ -184,12 +198,13 @@ struct server {
 	struct listeners		 slisteners;
 	struct receivers		 receivers;
 
+	enum db_state			 db_state;
 	PGconn				*db;
-	struct event			 db_ev_rd;
-	struct event			 db_ev_wr;
+	struct event			 db_rev;
+	struct event			 db_wev;
 
+	struct message			*message;
 	struct messages			 messages;
-	struct event			 store;
 
 	struct tls			*tls_ctx;
 	struct tls_config		*tls_cfg;
@@ -202,7 +217,6 @@ static void	 receivers_bind(struct server *s, int,
 static void	 server_listen(struct server *s);
 static void	 server_slisten(struct server *s);
 static void	 server_receive(struct server *s);
-static void	 server_store(int, short, void *);
 
 static void	 listener_accept(struct listener *, int, int);
 static void	 listener_accept_ev(int, short, void *);
@@ -217,6 +231,8 @@ static void	 syslog_tls_io(int, short, void *);
 static void	 syslog_input(struct conn *, size_t);
 
 static void	 db_connect(struct server *, const char *);
+static void	 db_read(int, short, void *);
+static void	 db_write(int, short, void *);
 
 static char	*id_gen(void);
 static void	 timestamptz(char *, size_t, const struct timespec *)
@@ -252,8 +268,6 @@ usage(void)
 
 	exit(1);
 }
-
-static const struct timeval store_timeval = { 0, 10000 };
 
 int debug = 0;
 
@@ -438,7 +452,14 @@ main(int argc, char *argv[])
 
 	event_init();
 
-	evtimer_set(&s->store, server_store, s);
+	event_set(&s->db_rev, PQsocket(s->db), EV_READ|EV_PERSIST,
+	    db_read, s);
+	event_set(&s->db_wev, PQsocket(s->db), EV_WRITE,
+	    db_write, s);
+
+	s->db_state = SDB_IDLE;
+	event_add(&s->db_rev, 0);
+
 	server_listen(s);
 	server_slisten(s);
 	server_receive(s);
@@ -660,9 +681,9 @@ server_receive(struct server *s)
 }
 
 static void
-server_store_message(struct server *s, struct message *msg)
+db_send_message(struct server *s)
 {
-	PGresult *result;
+	struct message *msg = s->message;
 	char seq[32];
 	int rv;
 
@@ -682,6 +703,8 @@ server_store_message(struct server *s, struct message *msg)
 		0, 0, 0, (int)msg->buflen,
 	};
 
+	assert(s->db_state == SDB_IDLE);
+
 	if (msg->connid != NULL) {
 		rv = snprintf(seq, sizeof(seq), "%lld", (long long)msg->seq);
 		if (rv < 0)
@@ -691,40 +714,34 @@ server_store_message(struct server *s, struct message *msg)
 	} else
 		values[5] = NULL;
 
-	result = PQexecPrepared(s->db, insert_stmt, INSERT_PARAMS,
-	    values, formats, lengths, 0);
-	if (result == NULL) {
-		lwarnc(ENOMEM, "db exec %s, dropping message from %s",
-		    insert_stmt, msg->raddr);
-		return;
-	}
-	if (PQresultStatus(result) != PGRES_COMMAND_OK) {
-		lwarnx("db exec %s: %s", insert_stmt,
-		    PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY));
-	}
-	PQclear(result);
+	ldebug("%s %s: %s/%s -> %s/%s: \"%s\"",
+	    msg->ts, msg->id,
+	    msg->raddr, msg->rport, msg->laddr, msg->lport,
+	    msg->buf);
+
+	if (!PQsendQueryPrepared(s->db, insert_stmt, INSERT_PARAMS,
+	    values, formats, lengths, 0))
+		lerrx(ENOMEM, "DB send query: %s", PQerrorMessage(s->db));
+
+	s->db_state = SDB_QUERY;
+
+	/* try and push the query out quickly */
+	db_write(PQsocket(s->db), EV_WRITE, s);
 }
 
 static void
-server_store(int nope, short events, void *arg)
+db_push(struct server *s)
 {
-	struct server *s = arg;
-	struct message *msg;
+	if (s->message == NULL) {
+		struct message *msg = TAILQ_FIRST(&s->messages);
+		assert(msg != NULL);
 
-	while ((msg = TAILQ_FIRST(&s->messages)) != NULL) {
 		TAILQ_REMOVE(&s->messages, msg, entry);
-
-		linfo("%s %s: %s/%s -> %s/%s: \"%s\"",
-		    msg->ts, msg->id,
-		    msg->raddr, msg->rport, msg->laddr, msg->lport,
-		    msg->buf);
-
-		server_store_message(s, msg);
-
-		(*msg->dtor)(msg);
-		free(msg->id);
-		free(msg);
+		s->message = msg;
 	}
+
+	if (s->db_state == SDB_IDLE)
+		db_send_message(s);
 }
 
 static void
@@ -970,8 +987,7 @@ message_queue(struct conn *conn)
 	msg->dtor = message_dtor_conn;
 
 	TAILQ_INSERT_TAIL(&s->messages, msg, entry);
-	if (!evtimer_pending(&s->store, NULL))
-		evtimer_add(&s->store, &store_timeval);
+	db_push(s);
 
 reset:
 	conn->head = conn->tail = conn->next;
@@ -1405,8 +1421,7 @@ syslog_recv(int fd, short events, void *arg)
 	msg->dtor = message_dtor_recv;
 
 	TAILQ_INSERT_TAIL(&s->messages, msg, entry);
-	if (!evtimer_pending(&s->store, NULL))
-		evtimer_add(&s->store, &store_timeval);
+	db_push(s);
 
 	return;
 
@@ -1475,6 +1490,7 @@ db_connect(struct server *s, const char *conn)
 	struct timespec ts;
 	char tstz[TIMESTAMPTZ_LEN];
 	char *id = id_gen();
+	int on;
 
 	const char *values[INSERT_PARAMS] = {
 		NULL, NULL, NULL, NULL, NULL, NULL,
@@ -1539,5 +1555,82 @@ db_connect(struct server *s, const char *conn)
 	}
 	PQclear(result);
 
-//	PQfinish(s->db);
+	if (PQsetnonblocking(s->db, 1) != 0)
+		errx(1, "unable to set db non-blocking");
+
+	on = 1;
+	if (ioctl(PQsocket(s->db), FIONBIO, &on, sizeof(on)) == -1)
+		err(1, "set db socket non-blocking");
+}
+
+static void
+db_read(int fd, short events, void *arg)
+{
+	struct server *s = arg;
+	struct message *msg;
+	PGresult *r;
+
+	if (!PQconsumeInput(s->db)) {
+		/* there was some kind of trouble */
+		lerrx(1, "DB consume failed: %s", PQerrorMessage(s->db));
+	}
+
+	if (PQisBusy(s->db)) {
+		/* wait for more data */
+		return;
+	}
+
+	while ((r = PQgetResult(s->db)) != NULL) {
+		assert(s->db_state == SDB_QUERY);
+
+		if (PQresultStatus(r) != PGRES_COMMAND_OK) {
+			lwarnx("db %s result: %s", insert_stmt,
+			    PQresultErrorField(r, PG_DIAG_MESSAGE_PRIMARY));
+		}
+		PQclear(r);
+	}
+	s->db_state = SDB_IDLE;
+
+	msg = s->message;
+	if (msg != NULL) {
+		s->message = NULL;
+
+		(*msg->dtor)(msg);
+		free(msg->id);
+		free(msg);
+
+		if (!TAILQ_EMPTY(&s->messages))
+			db_push(s);
+	}
+}
+
+static void
+db_write(int fd, short events, void *arg)
+{
+	struct server *s = arg;
+	int rv;
+
+	rv = PQflush(s->db);
+	switch (rv) {
+	case 0:
+		/*
+		 * Once PQflush returns 0, wait for the socket to
+		 * be read-ready and then read the response as described
+		 * above.
+		 */
+
+		/* s->db_rev is EV_PERSISTENT */
+		break;
+	case 1:
+		/*
+		 * If it returns 1, wait for the socket to become
+		 * read- or write-ready. If it becomes write-ready,
+		 * call PQflush again.
+		 */
+		event_add(&s->db_wev, NULL);
+		break;
+	case -1: /* it failed for some reason */
+		lerrx(1, "DB flush failed: %s", PQerrorMessage(s->db));
+		/* NOTREACHED */
+	}
 }
