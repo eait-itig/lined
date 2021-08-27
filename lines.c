@@ -576,26 +576,19 @@ receivers_bind(struct server *s, int af, const char *host, const char *port)
 			continue;
 		}
 
-		if (bind(fd, res->ai_addr, res->ai_addrlen) == -1) {
-			serrno = errno;
-			cause = "bind";
-			close(fd);
-			continue;
-		}
-
-		on = 1;
-		if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT,
-		    &on, sizeof(on)) == -1) {
-			warn("receiver %s port %s enable reuse port",
-			    host ? host : "*", port);
-                }
-
 		on = 1;
 		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
 		    &on, sizeof(on)) == -1) {
 			warn("receiver %s port %s enable reuse addr",
 			    host ? host : "*", port);
                 }
+
+		if (bind(fd, res->ai_addr, res->ai_addrlen) == -1) {
+			serrno = errno;
+			cause = "bind";
+			close(fd);
+			continue;
+		}
 
 		switch (res->ai_family) {
 		case AF_INET:
