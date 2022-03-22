@@ -142,7 +142,41 @@ struct message {
 	 */
 };
 
-TAILQ_HEAD(messages, message);
+struct messages {
+	TAILQ_HEAD(, message)		 list;
+	unsigned int			 count;
+};
+
+#define MESSAGES_INITIALIZER(_msgs) { 					\
+	.list	= TAILQ_HEAD_INITIALIZER(_msgs.list),			\
+	.count	= 0,							\
+}
+
+static inline int
+messages_empty(struct messages *msgs)
+{
+	return (msgs->count == 0);
+}
+
+static inline struct message *
+messages_first(struct messages *msgs)
+{
+	return (TAILQ_FIRST(&msgs->list));
+}
+
+static inline void
+messages_remove(struct messages *msgs, struct message *msg)
+{
+	TAILQ_REMOVE(&msgs->list, msg, entry);
+	msgs->count--;
+}
+
+static inline void
+messages_insert_tail(struct messages *msgs, struct message *msg)
+{
+	msgs->count--;
+	TAILQ_INSERT_TAIL(&msgs->list, msg, entry);
+}
 
 struct conn {
 	struct server			*server;
@@ -287,7 +321,7 @@ main(int argc, char *argv[])
 		.listeners = TAILQ_HEAD_INITIALIZER(server.listeners),
 		.slisteners = TAILQ_HEAD_INITIALIZER(server.slisteners),
 		.receivers = TAILQ_HEAD_INITIALIZER(server.receivers),
-		.messages = TAILQ_HEAD_INITIALIZER(server.messages),
+		.messages = MESSAGES_INITIALIZER(server.messages),
 	};
 	struct server *s = &server;
 
@@ -734,10 +768,10 @@ static void
 db_push(struct server *s)
 {
 	if (s->message == NULL) {
-		struct message *msg = TAILQ_FIRST(&s->messages);
+		struct message *msg = messages_first(&s->messages);
 		assert(msg != NULL);
 
-		TAILQ_REMOVE(&s->messages, msg, entry);
+		messages_remove(&s->messages, msg);
 		s->message = msg;
 	}
 
@@ -993,7 +1027,7 @@ message_queue(struct conn *conn)
 	msg->cookie = conn_ref(conn);
 	msg->dtor = message_dtor_conn;
 
-	TAILQ_INSERT_TAIL(&s->messages, msg, entry);
+	messages_insert_tail(&s->messages, msg);
 	db_push(s);
 
 reset:
@@ -1431,7 +1465,7 @@ syslog_recv(int fd, short events, void *arg)
 	msg->cookie = NULL;
 	msg->dtor = message_dtor_recv;
 
-	TAILQ_INSERT_TAIL(&s->messages, msg, entry);
+	messages_insert_tail(&s->messages, msg);
 	db_push(s);
 
 	return;
@@ -1610,7 +1644,7 @@ db_read(int fd, short events, void *arg)
 		free(msg->id);
 		free(msg);
 
-		if (!TAILQ_EMPTY(&s->messages))
+		if (!messages_empty(&s->messages))
 			db_push(s);
 	}
 }
