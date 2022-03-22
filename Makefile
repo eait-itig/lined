@@ -14,4 +14,6 @@ DPADD+=		${LIBEVENT} ${LIBTLS} ${LIBSSL} ${LIBCRYPTO}
 WARNINGS=	Yes
 DEBUG=		-g
 
+BINDIR=/opt/local/sbin
+
 .include <bsd.prog.mk>
