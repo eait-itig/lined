@@ -174,7 +174,7 @@ messages_remove(struct messages *msgs, struct message *msg)
 static inline void
 messages_insert_tail(struct messages *msgs, struct message *msg)
 {
-	msgs->count--;
+	msgs->count++;
 	TAILQ_INSERT_TAIL(&msgs->list, msg, entry);
 }
 
