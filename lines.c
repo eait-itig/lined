@@ -447,8 +447,14 @@ main(int argc, char *argv[])
 
 	signal(SIGPIPE, SIG_IGN);
 
-	if (!debug && daemon(1, 1) == -1)
-		err(1, "daemon");
+	if (!debug) {
+		extern char *__progname;
+
+		if (daemon(1, 0) == -1)
+			err(1, "daemon");
+
+		logger_syslog(__progname);
+	}
 
 	event_init();
 
@@ -764,7 +770,14 @@ listener_accept(struct listener *l, int fd, int tls)
 
 	cfd = accept4(fd, (struct sockaddr *)&ss, &sslen, SOCK_NONBLOCK);
 	if (cfd == -1) {
-		lwarn("accept");
+		switch (errno) {
+		case EINTR:
+		case EAGAIN:
+			break;
+		default:
+			lwarn("accept");
+			break;
+		}
 		return;
 	}
 
@@ -856,7 +869,7 @@ listener_accept(struct listener *l, int fd, int tls)
 		    syslog_tls_io, conn);
 		event_add(&conn->rev, NULL);
 
-		ldebug("TLS connection from %s to %s",
+		linfo("TLS connection from %s to %s",
 		    conn->raddr, conn->laddr);
 
 		syslog_tls_io(cfd, EV_READ, conn);
@@ -866,7 +879,7 @@ listener_accept(struct listener *l, int fd, int tls)
 		    syslog_read, conn);
 		event_add(&conn->rev, NULL);
 
-		ldebug("connection from %s to %s",
+		linfo("connection from %s to %s",
 		    conn->raddr, conn->laddr);
 	}
 
@@ -1100,7 +1113,7 @@ syslog_read(int cfd, short events, void *arg)
 		}
 		return;
 	case 0:
-		ldebug("connection from %s closed", conn->raddr);
+		linfo("connection from %s closed", conn->raddr);
 		conn_close(conn);
 		return;
 	default:
@@ -1131,7 +1144,7 @@ syslog_tls_io(int cfd, short events, void *arg)
 		conn_close(conn);
 		return;
 	case 0:
-		ldebug("TLS connection from %s closed", conn->raddr);
+		linfo("TLS connection from %s closed", conn->raddr);
 		conn_close(conn);
 		return;
 	default:
