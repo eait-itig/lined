@@ -303,6 +303,25 @@ usage(void)
 	exit(1);
 }
 
+static void
+gcore(void)
+{
+	pid_t p;
+
+	p = fork();
+	switch (p) {
+	case -1:
+		lwarn("gcore fork"); /* XXX */
+		return;
+	case 0: /* child */
+		/* crash */
+		abort();
+		/* NOTREACHED */
+	default:
+		return;
+	}
+}
+
 int debug = 0;
 
 static const char *
@@ -480,6 +499,7 @@ main(int argc, char *argv[])
 	db_connect(s, conn);
 
 	signal(SIGPIPE, SIG_IGN);
+	signal(SIGCHLD, SIG_IGN); /* gcore help */
 
 	if (!debug) {
 		extern char *__progname;
@@ -1250,6 +1270,7 @@ syslog_input(struct conn *conn, size_t len)
 		if (conn->buflen >= LINES_BUFLEN_MAX) {
 			lwarnx("line from %s is too long (%zu bytes), closing",
 			    conn->raddr, conn->buflen);
+			gcore();
 			conn_close(conn);
 			return;
 		}
