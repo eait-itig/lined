@@ -142,41 +142,38 @@ struct message {
 	 */
 };
 
-struct messages {
-	TAILQ_HEAD(, message)		 list;
-	unsigned int			 count;
-};
+TAILQ_HEAD(messages, message);
 
-#define MESSAGES_INITIALIZER(_msgs) { 					\
-	.list	= TAILQ_HEAD_INITIALIZER(_msgs.list),			\
-	.count	= 0,							\
-}
+#define MESSAGES_INITIALIZER(_msgs) TAILQ_HEAD_INITIALIZER(_msgs)
 
+#if 0
 static inline int
 messages_empty(struct messages *msgs)
 {
-	return (msgs->count == 0);
+	return (TAILQ_EMPTY(msgs));
 }
+#endif
 
 static inline struct message *
 messages_first(struct messages *msgs)
 {
-	return (TAILQ_FIRST(&msgs->list));
+	return (TAILQ_FIRST(msgs));
 }
 
 static inline void
 messages_remove(struct messages *msgs, struct message *msg)
 {
-	TAILQ_REMOVE(&msgs->list, msg, entry);
-	msgs->count--;
+	TAILQ_REMOVE(msgs, msg, entry);
 }
 
 static inline void
 messages_insert_tail(struct messages *msgs, struct message *msg)
 {
-	msgs->count++;
-	TAILQ_INSERT_TAIL(&msgs->list, msg, entry);
+	TAILQ_INSERT_TAIL(msgs, msg, entry);
 }
+
+static const struct timeval messages_wait = { 1, 0 };
+static const unsigned int messages_limit = 1000;
 
 struct conn {
 	struct server			*server;
@@ -227,6 +224,15 @@ struct receiver {
 
 TAILQ_HEAD(receivers, receiver);
 
+struct transaction {
+	TAILQ_ENTRY(transaction)	 entry;
+	struct server			*server;
+	struct messages			 messages;
+	struct message			*message;
+};
+
+TAILQ_HEAD(transactions, transaction);
+
 struct server {
 	struct listeners		 listeners;
 	struct listeners		 slisteners;
@@ -237,8 +243,11 @@ struct server {
 	struct event			 db_rev;
 	struct event			 db_wev;
 
-	struct message			*message;
 	struct messages			 messages;
+	unsigned int			 messages_num;
+	struct event			 messages_tmo;
+	struct transactions		 transactions;
+	struct transaction		*transaction;
 
 	struct tls			*tls_ctx;
 	struct tls_config		*tls_cfg;
@@ -271,6 +280,10 @@ static void	 db_write(int, short, void *);
 static char	*id_gen(void);
 static void	 timestamptz(char *, size_t, const struct timespec *)
 		     __attribute__ ((__bounded__(__buffer__,1,2)));
+
+static void	 message_store(struct server *, struct message *);
+static void	 message_free(struct message *);
+static void	 messages_push(int, short, void *);
 
 static void
 refcnt_init(struct refcnt *r)
@@ -341,6 +354,7 @@ main(int argc, char *argv[])
 		.slisteners = TAILQ_HEAD_INITIALIZER(server.slisteners),
 		.receivers = TAILQ_HEAD_INITIALIZER(server.receivers),
 		.messages = MESSAGES_INITIALIZER(server.messages),
+		.transactions = TAILQ_HEAD_INITIALIZER(server.transactions),
 	};
 	struct server *s = &server;
 
@@ -516,6 +530,8 @@ main(int argc, char *argv[])
 	    db_read, s);
 	event_set(&s->db_wev, PQsocket(s->db), EV_WRITE,
 	    db_write, s);
+
+	evtimer_set(&s->messages_tmo, messages_push, s);
 
 	s->db_state = SDB_IDLE;
 	event_add(&s->db_rev, 0);
@@ -734,9 +750,10 @@ server_receive(struct server *s)
 }
 
 static void
-db_send_message(struct server *s)
+db_send_message(struct transaction *t)
 {
-	struct message *msg = s->message;
+	struct server *s = t->server;
+	struct message *msg = t->message;
 	char seq[32];
 	int rv;
 
@@ -785,18 +802,100 @@ db_send_message(struct server *s)
 }
 
 static void
+db_send_transaction(struct server *s)
+{
+	struct transaction *t = s->transaction;
+	struct message *msg;
+
+	assert(s->db_state == SDB_IDLE);
+	assert(t->message == NULL);
+
+	msg = messages_first(&t->messages);
+	messages_remove(&t->messages, msg);
+
+	t->message = msg;
+	db_send_message(t);
+}
+
+static void
+message_store(struct server *s, struct message *msg)
+{
+	unsigned int n;
+
+	messages_insert_tail(&s->messages, msg);
+	n = s->messages_num++;
+
+	if (n == 0) {
+		ldebug("scheduling transaction");
+		evtimer_add(&s->messages_tmo, &messages_wait);
+	} else if (n >= messages_limit) {
+		ldebug("message limit %u hit", messages_limit);
+		evtimer_del(&s->messages_tmo);
+		messages_push(0, 0, s);
+	}
+}
+
+static void
+messages_free(struct messages *msgs)
+{
+	struct message *msg, *nmsg;
+
+	TAILQ_FOREACH_SAFE(msg, msgs, entry, nmsg) {
+		messages_remove(msgs, msg);
+		message_free(msg);
+	}
+}
+
+static void
 db_push(struct server *s)
 {
-	if (s->message == NULL) {
-		struct message *msg = messages_first(&s->messages);
-		assert(msg != NULL);
+	if (s->transaction == NULL) {
+		struct transaction *t = TAILQ_FIRST(&s->transactions);
+		assert(t != NULL);
 
-		messages_remove(&s->messages, msg);
-		s->message = msg;
+		TAILQ_REMOVE(&s->transactions, t, entry);
+		s->transaction = t;
 	}
 
 	if (s->db_state == SDB_IDLE)
-		db_send_message(s);
+		db_send_transaction(s);
+}
+
+static void
+messages_push(int nil, short events, void *arg)
+{
+	struct server *s = arg;
+	struct transaction *t;
+
+	t = malloc(sizeof(*t));
+	if (t == NULL) {
+		messages_free(&s->messages);
+
+		lwarn("unable to allocate transaction, dropping %u %s",
+		    s->messages_num,
+		    s->messages_num == 1 ? "message" : "messages");
+
+		TAILQ_INIT(&s->messages); /* this should be a nop */
+		s->messages_num = 0;
+
+		return;
+	}
+
+	ldebug("pushing transaction for %u %s",
+	    s->messages_num,
+	    s->messages_num == 1 ? "message" : "messages");
+
+	t->server = s;
+	TAILQ_INIT(&t->messages);
+	t->message = NULL;
+
+	TAILQ_CONCAT(&t->messages, &s->messages, entry);
+
+	TAILQ_INIT(&s->messages);
+	s->messages_num = 0;
+
+	TAILQ_INSERT_TAIL(&s->transactions, t, entry);
+	db_push(s);
 }
 
 static void
@@ -1047,8 +1146,7 @@ message_queue(struct conn *conn)
 	msg->cookie = conn_ref(conn);
 	msg->dtor = message_dtor_conn;
 
-	messages_insert_tail(&s->messages, msg);
-	db_push(s);
+	message_store(s, msg);
 
 reset:
 	conn->head = conn->tail = conn->next;
@@ -1486,8 +1584,7 @@ syslog_recv(int fd, short events, void *arg)
 	msg->cookie = NULL;
 	msg->dtor = message_dtor_recv;
 
-	messages_insert_tail(&s->messages, msg);
-	db_push(s);
+	message_store(s, msg);
 
 	return;
 
@@ -1630,9 +1727,18 @@ db_connect(struct server *s, const char *conn)
 }
 
 static void
+message_free(struct message *msg)
+{
+	(*msg->dtor)(msg);
+	free(msg->id);
+	free(msg);
+}
+
+static void
 db_read(int fd, short events, void *arg)
 {
 	struct server *s = arg;
+	struct transaction *t = s->transaction;
 	struct message *msg;
 	PGresult *r;
 
@@ -1657,16 +1763,18 @@ db_read(int fd, short events, void *arg)
 	}
 	s->db_state = SDB_IDLE;
 
-	msg = s->message;
-	if (msg != NULL) {
-		s->message = NULL;
+	msg = TAILQ_NEXT(t->message, entry);
+	if (msg == NULL) { /* transaction is complete */
+		s->transaction = NULL;
 
-		(*msg->dtor)(msg);
-		free(msg->id);
-		free(msg);
+		messages_free(&t->messages);
+		free(t);
 
-		if (!messages_empty(&s->messages))
+		if (!TAILQ_EMPTY(&s->transactions))
 			db_push(s);
+	} else {
+		t->message = msg;
+		db_send_message(t);
 	}
 }
 
