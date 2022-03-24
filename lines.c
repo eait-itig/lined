@@ -146,13 +146,11 @@ TAILQ_HEAD(messages, message);
 
 #define MESSAGES_INITIALIZER(_msgs) TAILQ_HEAD_INITIALIZER(_msgs)
 
-#if 0
 static inline int
 messages_empty(struct messages *msgs)
 {
 	return (TAILQ_EMPTY(msgs));
 }
-#endif
 
 static inline struct message *
 messages_first(struct messages *msgs)
@@ -224,11 +222,19 @@ struct receiver {
 
 TAILQ_HEAD(receivers, receiver);
 
+enum tx_state {
+	STX_IDLE,
+	STX_BEGIN,
+	STX_MSGS,
+	STX_COMMIT,
+};
+
 struct transaction {
 	TAILQ_ENTRY(transaction)	 entry;
 	struct server			*server;
 	struct messages			 messages;
 	struct message			*message;
+	enum tx_state			 state;
 };
 
 TAILQ_HEAD(transactions, transaction);
@@ -750,6 +756,20 @@ server_receive(struct server *s)
 }
 
 static void
+db_send_query(struct server *s, const char *query)
+{
+	assert(s->db_state == SDB_IDLE);
+
+	if (!PQsendQuery(s->db, query))
+		lerrx(ENOMEM, "DB send %s: %s", query, PQerrorMessage(s->db));
+
+	s->db_state = SDB_QUERY;
+
+	/* try and push the query out quickly */
+	db_write(PQsocket(s->db), EV_WRITE, s);
+}
+
+static void
 db_send_message(struct transaction *t)
 {
 	struct server *s = t->server;
@@ -805,16 +825,13 @@ static void
 db_send_transaction(struct server *s)
 {
 	struct transaction *t = s->transaction;
-	struct message *msg;
 
 	assert(s->db_state == SDB_IDLE);
 	assert(t->message == NULL);
+	assert(t->state == STX_IDLE);
 
-	msg = messages_first(&t->messages);
-	messages_remove(&t->messages, msg);
-
-	t->message = msg;
-	db_send_message(t);
+	t->state = STX_BEGIN;
+	db_send_query(s, "BEGIN");
 }
 
 static void
@@ -823,14 +840,18 @@ message_store(struct server *s, struct message *msg)
 	unsigned int n;
 
 	messages_insert_tail(&s->messages, msg);
-	n = s->messages_num++;
+	n = ++s->messages_num;
 
-	if (n == 0) {
+	if (n == 1) {
+#if 0
 		ldebug("scheduling transaction");
+#endif
 		evtimer_add(&s->messages_tmo, &messages_wait);
 	} else if (n >= messages_limit) {
+#if 0
 		ldebug("message limit %u hit", messages_limit);
 		evtimer_del(&s->messages_tmo);
+#endif
 		messages_push(0, 0, s);
 	}
 }
@@ -852,6 +873,7 @@ db_push(struct server *s)
 	if (s->transaction == NULL) {
 		struct transaction *t = TAILQ_FIRST(&s->transactions);
 		assert(t != NULL);
+		assert(!messages_empty(&t->messages));
 
 		TAILQ_REMOVE(&s->transactions, t, entry);
 		s->transaction = t;
@@ -881,13 +903,16 @@ messages_push(int nil, short events, void *arg)
 		return;
 	}
 
+#if 0
 	ldebug("pushing transaction for %u %s",
 	    s->messages_num,
 	    s->messages_num == 1 ? "message" : "messages");
+#endif
 
 	t->server = s;
 	TAILQ_INIT(&t->messages);
 	t->message = NULL;
+	t->state = STX_IDLE;
 
 	TAILQ_CONCAT(&t->messages, &s->messages, entry);
 
@@ -1738,7 +1763,7 @@ static void
 db_read(int fd, short events, void *arg)
 {
 	struct server *s = arg;
-	struct transaction *t = s->transaction;
+	struct transaction *t;
 	struct message *msg;
 	PGresult *r;
 
@@ -1763,8 +1788,34 @@ db_read(int fd, short events, void *arg)
 	}
 	s->db_state = SDB_IDLE;
 
-	msg = TAILQ_NEXT(t->message, entry);
-	if (msg == NULL) { /* transaction is complete */
+	t = s->transaction;
+
+	switch (t->state) {
+	case STX_IDLE:
+		lwarnx("unexpected IDLE state in transaction");
+		abort();
+		/* NOTREACHED */
+
+	case STX_BEGIN:
+		msg = messages_first(&t->messages);
+		assert(msg != NULL);
+		t->state = STX_MSGS;
+		break;
+
+	case STX_MSGS:
+		msg = TAILQ_NEXT(t->message, entry);
+		if (msg == NULL) {
+			t->message = NULL;
+			t->state = STX_COMMIT;
+			db_send_query(s, "COMMIT");
+			return;
+		}
+
+		/* else move onto the next message */
+		break;
+
+	case STX_COMMIT:
+		/* transaction is complete */
 		s->transaction = NULL;
 
 		messages_free(&t->messages);
@@ -1772,10 +1823,12 @@ db_read(int fd, short events, void *arg)
 
 		if (!TAILQ_EMPTY(&s->transactions))
 			db_push(s);
-	} else {
-		t->message = msg;
-		db_send_message(t);
+		return;
 	}
+
+	t->message = msg;
+	assert(t->state == STX_MSGS);
+	db_send_message(t);
 }
 
 static void
