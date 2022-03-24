@@ -850,8 +850,8 @@ message_store(struct server *s, struct message *msg)
 	} else if (n >= messages_limit) {
 #if 0
 		ldebug("message limit %u hit", messages_limit);
-		evtimer_del(&s->messages_tmo);
 #endif
+		evtimer_del(&s->messages_tmo);
 		messages_push(0, 0, s);
 	}
 }
