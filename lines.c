@@ -1390,7 +1390,18 @@ syslog_input(struct conn *conn, size_t len)
 	if (conn->next == conn->buflen) {
 		unsigned char *nbuf;
 
+		if (conn->head > 0) {
+			memmove(conn->buf, conn->buf + conn->head,
+			    conn->next - conn->head);
+			conn->next -= conn->head;
+			conn->tail -= conn->head;
+			conn->head = 0;
+
+			return;
+		}
+
 		if (conn->buflen >= LINES_BUFLEN_MAX) {
+
 			lwarnx("line from %s is too long (%zu bytes), closing",
 			    conn->raddr, conn->buflen);
 			gcore();
